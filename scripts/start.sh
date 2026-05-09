@@ -2,6 +2,7 @@
 # Resume the VM after stop.
 
 . "$(dirname "$0")/env.sh"
+set -eu
 
 require_cmd limactl
 

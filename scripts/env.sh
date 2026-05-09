@@ -13,8 +13,14 @@
 #   HERMES_VM_NAME   Lima instance name. Default: ubuntu-hermes
 #
 # Hard fails if a required CLI is missing.
+#
+# Note: this file does NOT enable `set -eu` when sourced — that flag would
+# persist in the caller's shell, killing interactive sessions on the next
+# unset-variable reference (tab completion, prompts, etc.). Caller scripts
+# enable strict mode themselves immediately after sourcing this file.
+# When run directly (`bash env.sh`), the conditional below still applies it.
 
-set -eu
+(return 0 2>/dev/null) || set -eu
 
 : "${HERMES_VM_HOME:=${HOME}/hermes-vm-data}"
 : "${LIMA_HOME:=${HERMES_VM_HOME}/lima}"

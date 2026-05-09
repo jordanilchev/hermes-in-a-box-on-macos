@@ -38,6 +38,7 @@ provisioning.
   - [Configuration](#configuration)
   - [Step-by-step setup from scratch](#step-by-step-setup-from-scratch)
   - [Verification](#verification)
+  - [Installing Hermes Agent](#installing-hermes-agent)
   - [Daily use](#daily-use)
   - [Snapshot strategy](#snapshot-strategy)
   - [Troubleshooting](#troubleshooting)
@@ -73,11 +74,12 @@ dataset snapshots plus APFS `cp -c` clone-on-write of the whole VM), and
 minimal host integration (no shared mounts, no clipboard, no agent
 forwarding). The stack is Lima 2.1.1 with the Apple Virtualization Framework
 (`vmType: vz`) on Apple Silicon, an Ubuntu 24.04 LTS Server cloud image
-(arm64), a 200 GiB encrypted ZFS pool (`tank`) holding `/var/lib/docker`
-plus three Hermes datasets, Docker (`docker.io`) using the ZFS storage
-driver with `no-new-privileges` and ICC disabled, and UFW deny-all-by-default
-with an explicit allow-list (53/80/443/123 outbound, 22 inbound for
-`limactl shell`).
+(arm64), a 200 GiB encrypted ZFS pool (`tank`) holding three Hermes
+datasets (`tank/hermes`, `tank/hermes-var`, `tank/hermes-log`), no
+system Docker daemon (Hermes brings its own rootless dockerd, owned by
+the unprivileged `hermes` user), and UFW deny-all-by-default with an
+explicit allow-list (53/80/443/123 outbound, 22 inbound for `limactl
+shell`).
 
 ---
 
@@ -198,9 +200,12 @@ the security posture.
 ```
 
 Runs the full hardening test suite (internet reachable, LAN unreachable,
-UFW posture, Docker storage driver, ZFS health, key auto-load,
-fail2ban / unattended-upgrades / cloud-final silencer). Prints
-`PASS` / `FAIL` per check and exits 0 only on full pass.
+UFW posture, no system dockerd, rootless dockerd up for hermes, ZFS
+health, key auto-load, fail2ban / unattended-upgrades / cloud-final
+silencer, plus a Hermes hardening regression block: hermes not in any
+privileged group, cannot write `/etc`, cannot disable UFW, cannot read
+`/etc/zfs/tank.key`, sshd hardening directives intact). Prints `PASS` /
+`FAIL` per check and exits 0 only on full pass.
 
 If you want to inspect the same things by hand:
 
@@ -218,24 +223,78 @@ ping -c 1 -W 2 172.16.0.1  ; echo "exit=$?"
 # Firewall posture
 sudo ufw status verbose
 
-# Docker on ZFS
-sudo docker info | grep "Storage Driver"      # → "Storage Driver: zfs"
+# Rootless Docker (only after ./scripts/hermes-install.sh has run)
+sudo -iu hermes docker info | grep -i rootless     # → "rootless"
+[ ! -S /var/run/docker.sock ] && echo "no system dockerd, good"
 
 # ZFS pool + snapshots
 zpool status tank
 zfs list -t snapshot -r tank
 
 # Core services
-systemctl is-active docker fail2ban unattended-upgrades cloud-final.service
+systemctl is-active fail2ban unattended-upgrades cloud-final.service
 ```
+
+### Installing Hermes Agent
+
+[Nous Research's Hermes Agent](https://github.com/NousResearch/hermes-agent)
+runs inside the VM as the unprivileged `hermes` user, with five
+defense-in-depth layers between agent-emitted commands and the host's
+hardening.
+
+```bash
+./scripts/hermes-install.sh              # one-time: rootless docker + hermes binary
+./scripts/hermes-config.sh               # set an API key (prompted, never on host disk)
+./scripts/hermes-gateway.sh start        # start the long-running daemon (optional)
+./scripts/hermes.sh chat                 # interactive
+./scripts/hermes-gateway.sh logs         # follow daemon logs
+```
+
+`hermes-install.sh` is idempotent — it sets up rootless dockerd for the
+`hermes` user, runs the upstream installer (only if `~/.local/bin/hermes`
+is missing), and configures `terminal.backend=docker` so every tool call
+runs inside a rootless container. `hermes-config.sh` prompts for a key
+name (default `OPENROUTER_API_KEY`) and value; the value is piped via
+stdin so it is never visible in `ps`.
+
+The gateway daemon is shipped disabled. After setting an API key, start
+it manually with `./scripts/hermes-gateway.sh start`. Logs follow with
+`./scripts/hermes-gateway.sh logs`.
+
+**Layered sandbox**
+
+1. **Hermes app-layer guards** (always on) — approval system, hardline
+   blocklist, path-write protection, SSRF protection.
+2. **`hermes` user boundary** — no sudo, no privileged groups, owns only
+   `/srv/hermes`, `/var/lib/hermes`, `/var/log/hermes` (encrypted ZFS).
+3. **systemd unit hardening** — `hermes-gateway.service` runs with
+   `ProtectSystem=strict`, `ProtectHome=read-only`, empty
+   `CapabilityBoundingSet`, `SystemCallFilter=@system-service`,
+   `MemoryDenyWriteExecute`, `RestrictAddressFamilies=AF_UNIX AF_INET
+   AF_INET6`. Drops `CAP_NET_ADMIN` (cannot modify UFW) and
+   `CAP_NET_BIND_SERVICE` (cannot bind <1024 to hijack ssh).
+4. **Rootless dockerd container per tool call** — `terminal.backend=docker`.
+   Container UID 0 maps to hermes's subuid 100000, never host root.
+   `--cap-drop ALL`, `--security-opt no-new-privileges`, `--pids-limit
+   256`, tmpfs `/tmp` with `noexec,nosuid` (Hermes's own defaults).
+5. **UFW outbound 53/80/443/123 only + LAN deny** — applies to container
+   traffic too (slirp4netns egresses via the host network namespace).
+
+`./scripts/verify.sh` enforces all of the above with regression checks
+for: no system dockerd, rootless dockerd up for hermes, hermes not in
+any privileged group, hermes cannot write `/etc`, UFW default policy
+unchanged, sshd hardening directives unchanged, hermes cannot disable
+UFW, hermes cannot read `/etc/zfs/tank.key`.
 
 ### Daily use
 
 ```bash
-./scripts/shell.sh                       # interactive shell
-./scripts/shell.sh -- sudo docker ps     # one-off command
-./scripts/stop.sh                        # power down (preserves state)
-./scripts/start.sh                       # resume
+./scripts/shell.sh                                       # interactive shell
+./scripts/shell.sh -- sudo -iu hermes docker ps          # rootless docker as hermes
+./scripts/hermes.sh chat                                 # interactive Hermes session
+./scripts/hermes-gateway.sh status                       # gateway daemon state
+./scripts/stop.sh                                        # power down (preserves state)
+./scripts/start.sh                                       # resume
 ```
 
 `HERMES_VM_HOME` (and therefore `LIMA_HOME`) must be set in every shell
@@ -256,7 +315,6 @@ A recursive snapshot named `hardened-baseline` is taken at provisioning
 time as `tank@hardened-baseline`. To roll back a single dataset:
 
 ```bash
-./scripts/shell.sh -- sudo zfs rollback tank/docker@hardened-baseline
 ./scripts/shell.sh -- sudo zfs rollback tank/hermes@hardened-baseline
 ```
 
@@ -309,7 +367,7 @@ per-script failures, which is why this YAML probes that file instead of
 Functional impact: zero. The error is a cosmetic systemd state.
 
 The silencer is provision step #6 in `ubuntu-hermes.yaml` (between the ZFS
-step and the Docker daemon.json step). It installs a systemd drop-in at
+step and the Hermes runtime user step). It installs a systemd drop-in at
 `/etc/systemd/system/cloud-final.service.d/swallow-exit.conf` containing
 `[Service]\nSuccessExitStatus=1`, which tells systemd to treat
 `cloud-final.service`'s exit-1 as success. Result: `systemctl --failed`
@@ -356,18 +414,21 @@ limactl list
 If the shell works, ignore the cosmetic timeout. `start.sh` already
 detects this case and continues without erroring.
 
-#### ZFS datasets unmounted after reboot, Docker fails to start
+#### ZFS datasets unmounted after reboot, services start on empty mount points
 
-Symptom: after a reboot, `/var/lib/docker`, `/srv/hermes`,
-`/var/lib/hermes`, and `/var/log/hermes` are empty (or owned by `root`
-with no contents); `systemctl status docker` shows ZFS-driver errors.
+Symptom: after a reboot, `/srv/hermes`, `/var/lib/hermes`, and
+`/var/log/hermes` are empty (or owned by `root` with no contents); the
+`hermes` user's rootless dockerd fails to start, and any service that
+depends on hermes's home (the gateway daemon, the Hermes binary at
+`/srv/hermes/.local/bin/hermes`) errors out.
 
 Root cause: Ubuntu ships an empty stub at
 `/lib/systemd/system/zfs-load-key.service` (effectively masked). With
 `keylocation=file:///etc/zfs/tank.key`, the encrypted datasets need an
 explicit `zfs load-key -a` after `zfs-import.target` and before
 `zfs-mount.service`, otherwise `zfs-mount.service` skips the locked
-datasets and Docker starts on top of an empty `/var/lib/docker`.
+datasets and the rootless docker daemon starts on top of an empty
+`/srv/hermes`.
 
 `ubuntu-hermes.yaml` installs a real unit at
 `/etc/systemd/system/zfs-load-key.service` (ordered `After=zfs-import.target`,
@@ -377,7 +438,8 @@ datasets and Docker starts on top of an empty `/var/lib/docker`.
 ./scripts/shell.sh -- sudo systemctl status zfs-load-key.service
 ./scripts/shell.sh -- sudo zfs load-key -a
 ./scripts/shell.sh -- sudo zfs mount -a
-./scripts/shell.sh -- sudo systemctl restart docker
+./scripts/shell.sh -- sudo -iu hermes systemctl --user restart docker
+./scripts/hermes-gateway.sh restart
 ```
 
 If the unit is missing or empty, re-run the ZFS provision step from
@@ -412,8 +474,11 @@ attempt to import the existing `tank` pool):
 # reads ${HERMES_VM_HOME}/tank.key.b64 by default; pass another path as arg 1
 ```
 
-`keyfile-restore.sh` writes the key inside the VM with mode 0400, calls
-`zfs load-key -a` and `zfs mount -a`, and restarts Docker.
+`keyfile-restore.sh` writes the key inside the VM with mode 0400 and
+calls `zfs load-key -a` followed by `zfs mount -a`. After restore, the
+hermes user's rootless dockerd will pick up the now-mounted home on its
+next start (or restart it manually with
+`./scripts/shell.sh -- sudo -iu hermes systemctl --user restart docker`).
 
 #### Lima YAML rejected with `unknown field "description"`
 
@@ -422,7 +487,7 @@ items inside `provision:`. Use `#` comments above the script instead:
 
 ```yaml
 provision:
-  # Install security packages and Docker.
+  # Install security packages.
   - mode: system
     script: |
       ...
@@ -446,8 +511,9 @@ tail -F "${LIMA_HOME}/${HERMES_VM_NAME:-ubuntu-hermes}/serial.log"
 # Guest side — the journal for the current boot
 ./scripts/shell.sh -- sudo journalctl -b 0 --no-pager
 ./scripts/shell.sh -- sudo journalctl -u cloud-final --no-pager
-./scripts/shell.sh -- sudo journalctl -u docker --no-pager
 ./scripts/shell.sh -- sudo journalctl -u zfs-load-key --no-pager
+./scripts/shell.sh -- sudo journalctl -u hermes-gateway --no-pager
+./scripts/shell.sh -- sudo -iu hermes journalctl --user -u docker --no-pager   # rootless dockerd
 ```
 
 #### I want to disable the VM and free its resources without deleting it

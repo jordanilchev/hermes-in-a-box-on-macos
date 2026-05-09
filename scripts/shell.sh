@@ -4,6 +4,7 @@
 #   ./scripts/shell.sh -- sudo docker ps  # one-off command
 
 . "$(dirname "$0")/env.sh"
+set -eu
 
 require_cmd limactl
 

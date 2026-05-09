@@ -3,6 +3,7 @@
 # Idempotent — safe to re-run after a partial failure.
 
 . "$(dirname "$0")/env.sh"
+set -eu
 
 require_cmd limactl
 

@@ -6,6 +6,7 @@
 # Backups land in ${HERMES_VM_HOME}/backups/<timestamp>/.
 
 . "$(dirname "$0")/env.sh"
+set -eu
 
 require_cmd limactl
 require_cmd cp

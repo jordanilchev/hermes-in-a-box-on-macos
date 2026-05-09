@@ -6,6 +6,7 @@
 #        e.g. ./scripts/restore.sh 20260509-113000
 
 . "$(dirname "$0")/env.sh"
+set -eu
 
 require_cmd limactl
 require_cmd cp

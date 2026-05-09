@@ -3,6 +3,7 @@
 # Requires explicit confirmation. Will NOT touch ${HERMES_VM_HOME}/backups/.
 
 . "$(dirname "$0")/env.sh"
+set -eu
 
 require_cmd limactl
 

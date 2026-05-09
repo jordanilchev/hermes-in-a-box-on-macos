@@ -81,15 +81,16 @@ containerd:
 # -----------------------------------------------------------------------------
 # Provisioning order (UFW is last so earlier outbound apt traffic isn't blocked):
 #   1. apt full-upgrade
-#   2. install security packages + Docker
+#   2. install security packages (no system Docker — Hermes uses rootless dockerd)
 #   3. SSH hardening
 #   4. DNS hardening
-#   5. ZFS pool + datasets   (must run before Docker daemon.json)
+#   5. ZFS pool + datasets
 #   6. cloud-final.service noise silencer (depends on ZFS being live)
-#   7. Docker daemon.json + restart (uses zfs storage driver)
-#   8. Hermes runtime user (datasets already mounted)
-#   9. unattended-upgrades
-#  10. UFW
+#   7. Hermes runtime user (datasets mounted; subuid/subgid + lingering for rootless dockerd)
+#   8. Hermes Agent system prerequisites (rootless docker apt repo, build deps, playwright libs)
+#   9. hermes-gateway.service systemd unit (disabled; operator starts manually)
+#  10. unattended-upgrades
+#  11. UFW
 # -----------------------------------------------------------------------------
 provision:
 
@@ -111,8 +112,6 @@ provision:
         fail2ban \
         auditd \
         unattended-upgrades \
-        docker.io \
-        docker-compose-v2 \
         curl \
         jq \
         git \
@@ -194,7 +193,8 @@ provision:
       fi
 
       # Datasets inherit encryption from `tank`. Idempotent.
-      zfs list tank/docker     >/dev/null 2>&1 || zfs create -o mountpoint=/var/lib/docker tank/docker
+      # tank/hermes hosts hermes's home, including rootless dockerd's data root
+      # at /srv/hermes/.local/share/docker — no separate dataset needed.
       zfs list tank/hermes     >/dev/null 2>&1 || zfs create -o mountpoint=/srv/hermes     tank/hermes
       zfs list tank/hermes-var >/dev/null 2>&1 || zfs create -o mountpoint=/var/lib/hermes tank/hermes-var
       zfs list tank/hermes-log >/dev/null 2>&1 || zfs create -o mountpoint=/var/log/hermes tank/hermes-log
@@ -260,34 +260,134 @@ provision:
     script: |
       #!/bin/bash
       set -eux -o pipefail
-      mkdir -p /etc/docker
-      cat > /etc/docker/daemon.json <<'EOF'
-      {
-        "storage-driver": "zfs",
-        "icc": false,
-        "live-restore": true,
-        "no-new-privileges": true,
-        "userland-proxy": false,
-        "log-driver": "json-file",
-        "log-opts": {
-          "max-size": "10m",
-          "max-file": "3"
-        }
-      }
-      EOF
-      systemctl enable docker
-      systemctl restart docker
-
-  - mode: system
-    script: |
-      #!/bin/bash
-      set -eux -o pipefail
-      id hermes >/dev/null 2>&1 || useradd -r -m -d /srv/hermes -s /usr/sbin/nologin hermes
+      if ! id hermes >/dev/null 2>&1; then
+        useradd -r -m -d /srv/hermes -s /bin/bash hermes
+      fi
+      # Shell may have been /usr/sbin/nologin in older provisions; fix idempotently.
+      [ "$(getent passwd hermes | cut -d: -f7)" = "/bin/bash" ] || usermod -s /bin/bash hermes
+      # subuid/subgid for rootless dockerd user-namespace mapping.
+      grep -q '^hermes:' /etc/subuid || usermod --add-subuids 100000-165535 hermes
+      grep -q '^hermes:' /etc/subgid || usermod --add-subgids 100000-165535 hermes
+      # Lingering so user-systemd / dbus session / XDG_RUNTIME_DIR come up at boot
+      # without an interactive login. Required for rootless dockerd at boot.
+      loginctl show-user hermes -p Linger 2>/dev/null | grep -q 'Linger=yes' \
+        || loginctl enable-linger hermes
       for d in /srv/hermes /var/lib/hermes /var/log/hermes; do
         mountpoint -q "$d" || { echo "$d not a mountpoint — ZFS step did not run cleanly" >&2; exit 1; }
         chown hermes:hermes "$d"
       done
       chmod 750 /var/log/hermes
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Hermes Agent system prerequisites:
+      #   - Docker upstream apt repo (Ubuntu's docker.io omits docker-ce-rootless-extras,
+      #     which ships dockerd-rootless-setuptool.sh).
+      #   - build deps for Python wheels (cffi etc.) used by Hermes.
+      #   - rootless docker runtime: uidmap, dbus-user-session, fuse-overlayfs,
+      #     slirp4netns, iptables.
+      #   - Playwright Chromium runtime libs (the per-user installer would otherwise
+      #     try to apt-install these via sudo, which hermes does not have).
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
+        install -d -m 0755 /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      fi
+      if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+        ARCH=$(dpkg --print-architecture)
+        . /etc/os-release
+        cat > /etc/apt/sources.list.d/docker.list <<EOF
+      deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable
+      EOF
+        apt-get update
+      fi
+      # Several Playwright runtime libs were renamed with `t64` suffixes in
+      # Ubuntu 24.04 (noble) as part of the time_t bit-width transition:
+      # libasound2, libatk1.0-0, libatk-bridge2.0-0, libcups2, libgtk-3-0.
+      # The non-t64 names still exist as transitional dummies but have no
+      # installation candidate on noble — apt-get fails with "no installation
+      # candidate". Use the t64 names directly.
+      apt-get install -y \
+        build-essential python3-dev libffi-dev \
+        ripgrep ffmpeg \
+        uidmap dbus-user-session fuse-overlayfs slirp4netns iptables \
+        libnss3 libnspr4 libdbus-1-3 libatk1.0-0t64 libatk-bridge2.0-0t64 \
+        libcups2t64 libdrm2 libgbm1 libxkbcommon0 libxcomposite1 libxdamage1 \
+        libxfixes3 libxrandr2 libgtk-3-0t64 libpango-1.0-0 libcairo2 libasound2t64 \
+        docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras
+
+      # Mask the system docker.service / docker.socket. We installed docker-ce
+      # only because docker-ce-rootless-extras depends on it for the dockerd
+      # binary. The system-level units must NEVER be activatable: hermes runs
+      # rootless dockerd as a user-systemd service instead. Masking redirects
+      # both units to /dev/null so even socket activation cannot start them.
+      systemctl disable --now docker.service docker.socket 2>/dev/null || true
+      systemctl mask docker.service docker.socket
+      # docker-ce's postinst briefly starts dockerd before we mask, which
+      # leaves /var/run/docker.sock as an orphaned file. Remove it so
+      # verify.sh's "no system docker socket" assertion holds.
+      rm -f /var/run/docker.sock
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Drop the hermes-gateway.service systemd unit. NOT enabled here —
+      # operator starts via ./scripts/hermes-gateway.sh after API key is set.
+      # Hardening goes beyond upstream's reference (NoNewPrivileges,
+      # ProtectSystem=strict, PrivateTmp): empty CapabilityBoundingSet so the
+      # unit can never gain CAP_NET_ADMIN (UFW) or CAP_NET_BIND_SERVICE (port
+      # 22 hijack); MemoryDenyWriteExecute; SystemCallFilter=@system-service.
+      # Environment uses %U specifier — expands to hermes's UID at start time
+      # so the rootless-docker socket path is correct regardless of which UID
+      # useradd -r assigned.
+      set -eux -o pipefail
+      cat > /etc/systemd/system/hermes-gateway.service <<'EOF'
+      [Unit]
+      Description=Hermes Agent gateway (Nous Research)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=hermes
+      Group=hermes
+      Environment=HOME=/srv/hermes
+      Environment=XDG_RUNTIME_DIR=/run/user/%U
+      Environment=DOCKER_HOST=unix:///run/user/%U/docker.sock
+      Environment=PATH=/srv/hermes/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      ExecStartPre=/bin/sh -c 'i=0; until test -S "$XDG_RUNTIME_DIR/docker.sock"; do i=$((i+1)); [ $i -ge 30 ] && exit 1; sleep 1; done'
+      ExecStart=/srv/hermes/.local/bin/hermes gateway
+      Restart=on-failure
+      RestartSec=5
+
+      NoNewPrivileges=yes
+      ProtectSystem=strict
+      ProtectHome=read-only
+      ReadWritePaths=/srv/hermes /var/lib/hermes /var/log/hermes
+      PrivateTmp=yes
+      PrivateDevices=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectKernelLogs=yes
+      ProtectControlGroups=yes
+      RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+      RestrictSUIDSGID=yes
+      LockPersonality=yes
+      MemoryDenyWriteExecute=yes
+      CapabilityBoundingSet=
+      AmbientCapabilities=
+      SystemCallFilter=@system-service
+      SystemCallArchitectures=native
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      chmod 0644 /etc/systemd/system/hermes-gateway.service
+      systemctl daemon-reload
 
   - mode: system
     script: |

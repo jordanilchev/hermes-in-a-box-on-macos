@@ -7,6 +7,7 @@
 #        defaults to ${HERMES_VM_HOME}/tank.key.b64
 
 . "$(dirname "$0")/env.sh"
+set -eu
 
 require_cmd limactl
 
@@ -26,7 +27,6 @@ limactl shell "${HERMES_VM_NAME}" -- sudo bash -c '
   chmod 0400 /etc/zfs/tank.key
   zfs load-key -a
   zfs mount -a
-  systemctl restart docker || true
 ' < "${IN}"
 
 echo "==> keyfile restored, datasets remounted"

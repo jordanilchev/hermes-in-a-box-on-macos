@@ -8,6 +8,7 @@
 # between you and the encrypted contents of the tank disk.
 
 . "$(dirname "$0")/env.sh"
+set -eu
 
 require_cmd limactl
 
