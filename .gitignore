@@ -1,0 +1,18 @@
+# Per-developer Claude Code config (allowlist, local paths)
+.claude/
+
+# macOS noise
+.DS_Store
+._*
+
+# Editor noise
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Backups of host-side keyfile — must NEVER be committed
+tank.key
+tank.key.b64
+*.key
+*.key.b64

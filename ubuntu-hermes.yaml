@@ -1,0 +1,334 @@
+# =============================================================================
+# Ubuntu-Hermes — hardened Ubuntu Server VM (Lima/vz translation of the
+# Parallels-based provisioning checklist)
+# =============================================================================
+#
+# How to use:
+#   See README.md > Section D. Day-to-day operations are wrapped in
+#   ./scripts/setup.sh, ./scripts/start.sh, ./scripts/shell.sh, etc.
+#   No path is hardcoded in this file or the scripts; configuration is
+#   driven by the HERMES_VM_HOME and LIMA_HOME environment variables.
+#
+# Plan drift from the Parallels-targeted checklist (intentional):
+#
+#   • Hypervisor: Parallels Desktop is not installed. We use Lima 2.1.1 with
+#     the Apple Virtualization Framework (vz) backend. Native ARM64, no GUI.
+#
+#   • Sections 2, 3.1, 5 (download ISO, GUI install, partitioning) are SKIPPED.
+#     Lima boots an Ubuntu 24.04 cloud image — already installed. Root is
+#     ext4 (cloud-image default).
+#
+#   • Section 4.x (Parallels-specific clipboard / drag-drop / shared profile /
+#     smart-mount / isolate-vm) is unnecessary: vz/Lima cloud images don't
+#     expose those host-integration features. `mounts: []` makes intent explicit.
+#
+#   • TPM is NOT exposed. vz on Apple Silicon does not surface a vTPM through
+#     Lima. Switch to UTM if measured boot is required.
+#
+#   • The `ops` admin account from Section 5.3 is NOT created. Lima manages
+#     SSH for the host user automatically; `limactl shell` is the admin entry.
+#
+#   • Section 5.2 ext4 → ZFS (data partitions only). A second 200 GiB virtual
+#     disk hosts an encrypted zpool `tank` with datasets for /var/lib/docker,
+#     /srv/hermes, /var/lib/hermes, /var/log/hermes. Pool encryption is
+#     aes-256-gcm with a keyfile at /etc/zfs/tank.key (auto-loaded at boot).
+#     Threat model: protects against offline theft of the data disk image,
+#     NOT against an attacker with root inside the VM.
+#
+#   • Snapshots (Section 14) are taken via:
+#       limactl stop ubuntu-hermes
+#       limactl snapshot create ubuntu-hermes --tag hardened-baseline
+#     ZFS dataset snapshots (`zfs snapshot tank/<ds>@tag`) are also available
+#     for fine-grained rollback.
+#
+# =============================================================================
+
+vmType: vz
+
+# Tune to your host. The defaults below assume ~80% of an 8-core / 16 GiB
+# Apple Silicon machine. See README.md > C. Recommended sizing.
+cpus: 8
+memory: "12GiB"
+disk: "60GiB"
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+# Second virtual disk for the ZFS data pool. Format=false → unformatted raw
+# block device; the provision script discovers it and runs `zpool create`.
+additionalDisks:
+  - name: "tank"
+    size: "200GiB"
+    format: false
+
+# Section 4.5 / 4.6 — no shared mounts. (Empty list is sufficient; setting
+# mountTypesUnsupported as well conflicts with Lima's default mountType.)
+mounts: []
+
+# User-mode NAT only — VM cannot reach the host LAN.
+networks: []
+
+ssh:
+  loadDotSSHPubKeys: true
+  forwardAgent: false
+  forwardX11: false
+
+containerd:
+  system: false
+  user: false
+
+# -----------------------------------------------------------------------------
+# Provisioning order (UFW is last so earlier outbound apt traffic isn't blocked):
+#   1. apt full-upgrade
+#   2. install security packages + Docker
+#   3. SSH hardening
+#   4. DNS hardening
+#   5. ZFS pool + datasets   (must run before Docker daemon.json)
+#   6. cloud-final.service noise silencer (depends on ZFS being live)
+#   7. Docker daemon.json + restart (uses zfs storage driver)
+#   8. Hermes runtime user (datasets already mounted)
+#   9. unattended-upgrades
+#  10. UFW
+# -----------------------------------------------------------------------------
+provision:
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get -y full-upgrade
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get install -y \
+        ufw \
+        fail2ban \
+        auditd \
+        unattended-upgrades \
+        docker.io \
+        docker-compose-v2 \
+        curl \
+        jq \
+        git \
+        htop
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      mkdir -p /etc/ssh/sshd_config.d
+      cat > /etc/ssh/sshd_config.d/99-hermes-hardening.conf <<'EOF'
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PubkeyAuthentication yes
+      PermitEmptyPasswords no
+      MaxAuthTries 3
+      X11Forwarding no
+      AllowTcpForwarding no
+      AllowAgentForwarding no
+      PermitTunnel no
+      EOF
+      sshd -t
+      systemctl restart ssh
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      mkdir -p /etc/systemd/resolved.conf.d
+      cat > /etc/systemd/resolved.conf.d/99-hermes.conf <<'EOF'
+      [Resolve]
+      DNS=1.1.1.2 9.9.9.9
+      FallbackDNS=1.0.0.2
+      DNSSEC=yes
+      EOF
+      systemctl restart systemd-resolved
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      apt-get install -y zfsutils-linux
+
+      # Keyfile (idempotent — never regenerate, would lock the existing pool out)
+      install -d -m 0700 -o root -g root /etc/zfs
+      if [ ! -s /etc/zfs/tank.key ]; then
+        umask 077
+        dd if=/dev/urandom of=/etc/zfs/tank.key bs=32 count=1 status=none
+        chmod 0400 /etc/zfs/tank.key
+      fi
+
+      # Pool — discover the unformatted data disk by exclusion (vz device
+      # names can vary between boots); only create if `tank` doesn't exist.
+      if ! zpool list tank >/dev/null 2>&1; then
+        ROOT_SRC=$(findmnt -no SOURCE /)
+        ROOT_DEV=$(lsblk -no PKNAME "$ROOT_SRC")
+        DATA_DEV=""
+        for dev in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}'); do
+          [ "$dev" = "$ROOT_DEV" ] && continue
+          if ! blkid "/dev/$dev" >/dev/null 2>&1; then
+            DATA_DEV="/dev/$dev"
+            break
+          fi
+        done
+        [ -n "$DATA_DEV" ] || { echo "no candidate data disk found" >&2; exit 1; }
+        zpool create -o ashift=12 \
+          -O compression=lz4 \
+          -O atime=off \
+          -O xattr=sa \
+          -O acltype=posixacl \
+          -O mountpoint=none \
+          -O encryption=aes-256-gcm \
+          -O keyformat=raw \
+          -O keylocation=file:///etc/zfs/tank.key \
+          tank "$DATA_DEV"
+      fi
+
+      # Datasets inherit encryption from `tank`. Idempotent.
+      zfs list tank/docker     >/dev/null 2>&1 || zfs create -o mountpoint=/var/lib/docker tank/docker
+      zfs list tank/hermes     >/dev/null 2>&1 || zfs create -o mountpoint=/srv/hermes     tank/hermes
+      zfs list tank/hermes-var >/dev/null 2>&1 || zfs create -o mountpoint=/var/lib/hermes tank/hermes-var
+      zfs list tank/hermes-log >/dev/null 2>&1 || zfs create -o mountpoint=/var/log/hermes tank/hermes-log
+
+      # Install zfs-load-key.service. Ubuntu ships an empty unit file at
+      # /lib/systemd/system/zfs-load-key.service (effectively masked). With
+      # keylocation=file:// we need a real loader to run after import and
+      # before mount, otherwise zfs-mount.service mounts only unencrypted
+      # datasets and our encrypted ones stay locked.
+      cat > /etc/systemd/system/zfs-load-key.service <<'UNIT'
+      [Unit]
+      Description=Load encryption keys for ZFS file systems
+      DefaultDependencies=no
+      After=zfs-import.target
+      Before=zfs-mount.service
+      Requires=zfs-import.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/zfs load-key -a
+
+      [Install]
+      WantedBy=zfs-mount.service
+      UNIT
+      systemctl daemon-reload
+      systemctl enable zfs-import-cache.service zfs-mount.service zfs.target zfs-load-key.service 2>/dev/null || true
+
+      # Make sure the running system is in the correct state for subsequent
+      # provision steps (Docker needs /var/lib/docker mounted now).
+      zfs load-key -a 2>/dev/null || true
+      zfs mount -a   2>/dev/null || true
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Silence the perpetual cloud-final.service failure caused by Lima's
+      # boot.sh chain. Lima's 05-lima-disks.sh hardcodes
+      #     mount -t ext4 /dev/vdb1 /mnt/lima-tank
+      # but on this VM /dev/vdb1 is a ZFS member partition (the encrypted
+      # `tank` pool from the previous provision step). The mount fails,
+      # boot.sh exits 1, scripts_per_boot reports a runparts failure, and
+      # cloud-final.service exits 1 every boot. The error is purely
+      # cosmetic — pool import, key load, dataset mounts, Docker, UFW, etc.
+      # all complete fine. Patches to /var/lib/cloud/scripts/per-boot/* are
+      # NOT durable: cloud-init's cached cidata regenerates write_files on
+      # every boot, reverting any in-place edit. The clean fix is at the
+      # systemd layer: tell cloud-final.service to accept exit 1 as success.
+      set -eux -o pipefail
+      mkdir -p /etc/systemd/system/cloud-final.service.d
+      cat > /etc/systemd/system/cloud-final.service.d/swallow-exit.conf <<'EOF'
+      # Lima/vz + ZFS workaround: cloud-init scripts_per_boot always exits 1
+      # because Lima boot.sh chain includes 05-lima-disks.sh, which hardcodes
+      # 'mount -t ext4 /dev/vdb1' against a ZFS member partition. The error
+      # is cosmetic; data and services come up fine. Accept exit 1 as success.
+      [Service]
+      SuccessExitStatus=1
+      EOF
+      chmod 0644 /etc/systemd/system/cloud-final.service.d/swallow-exit.conf
+      systemctl daemon-reload
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      mkdir -p /etc/docker
+      cat > /etc/docker/daemon.json <<'EOF'
+      {
+        "storage-driver": "zfs",
+        "icc": false,
+        "live-restore": true,
+        "no-new-privileges": true,
+        "userland-proxy": false,
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "3"
+        }
+      }
+      EOF
+      systemctl enable docker
+      systemctl restart docker
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      id hermes >/dev/null 2>&1 || useradd -r -m -d /srv/hermes -s /usr/sbin/nologin hermes
+      for d in /srv/hermes /var/lib/hermes /var/log/hermes; do
+        mountpoint -q "$d" || { echo "$d not a mountpoint — ZFS step did not run cleanly" >&2; exit 1; }
+        chown hermes:hermes "$d"
+      done
+      chmod 750 /var/log/hermes
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      EOF
+      systemctl enable --now unattended-upgrades
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      ufw --force reset
+      ufw default deny incoming
+      ufw default deny outgoing
+      ufw allow out 53
+      ufw allow out 80/tcp
+      ufw allow out 443/tcp
+      ufw allow out 123/udp
+      ufw allow 22/tcp
+      ufw deny out to 10.0.0.0/8
+      ufw deny out to 172.16.0.0/12
+      ufw deny out to 192.168.0.0/16
+      ufw --force enable
+      ufw status verbose
+
+probes:
+  # `cloud-init status --wait` would hang here because Lima's own 05-lima-disks.sh
+  # always fails (it tries `mount -t ext4 /dev/vdb1`, but vdb1 is a ZFS member),
+  # and cloud-final inherits that error state. Lima's boot.sh writes
+  # /run/lima-boot-done at the very end of its boot script chain regardless
+  # of per-script failures — that's our reliable boot-complete signal.
+  - description: "wait for Lima boot.sh to write /run/lima-boot-done"
+    script: |
+      #!/bin/bash
+      set -eu
+      until [ -f /run/lima-boot-done ]; do sleep 1; done
+    hint: |
+      /run/lima-boot-done was never written. Inspect Lima's boot script chain:
+        limactl shell ubuntu-hermes -- sudo journalctl -u cloud-final --no-pager
+        limactl shell ubuntu-hermes -- ls -l /run/lima-boot-done
