@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
-# Prompt for an API key name and value, store via `hermes config set`.
+# Prompt for an API key name and value, store in /srv/hermes/.hermes/.env.
+#
+# Why .env directly, not `hermes config set`:
+# Hermes splits state across two files — config.yaml (non-secret runtime
+# config: model, terminal backend, personalities) and .env (secrets:
+# OPENROUTER_API_KEY, etc.). `hermes config set` writes everything to
+# config.yaml indiscriminately, including obvious secrets, which then
+# never get picked up by the runtime (it reads keys from .env per
+# `hermes config env-path`). Earlier wrappers used `config set` and
+# silently stranded keys in the wrong file.
+#
 # Value path: host stdin → outer-bash (root, in VM) read → here-string
-# → inner-bash (hermes) read → hermes config set argv. Argv exposure
-# ends inside the VM, where hermes is the only non-root user.
+# → inner-bash (hermes) read → idempotent upsert into .env. Value never
+# enters argv at any hop.
 
 . "$(dirname "$0")/env.sh"
 set -eu
@@ -15,12 +25,17 @@ read -rsp "Value for ${name}: " value
 echo
 [ -n "${value}" ] || { echo "empty value, aborting" >&2; exit 1; }
 
-# The outer bash in the VM gets its script via -c (argv), not stdin.
-# Piping the script on stdin would race with the value: bash block-buffers
-# stdin while parsing (~4 KB on a pipe), so a downstream `read -r v` ends up
-# either grabbing nothing or executing the value as a command — the bug
-# this rewrite fixes. With -c, stdin stays untouched until our explicit
-# `read -r v` pulls the value off the pipe.
+# Defense-in-depth: env var names are ASCII identifiers. Reject anything
+# weirder before sending it through the heredoc, where weird chars could
+# break the regex used to find existing lines.
+case "${name}" in
+  ''|*[!A-Za-z0-9_]*) echo "invalid env-var name: ${name}" >&2; exit 1 ;;
+esac
+
+# Pass the script via `bash -c "$script"` (argv) so stdin stays free
+# for the value. Piping the script on stdin would race the value: bash
+# block-buffers stdin while parsing (~4 KB on a pipe), and a downstream
+# `read` would either grab nothing or execute the value as a command.
 quoted_name=$(printf '%q' "$name")
 script=$(cat <<EOS
 set -eu
@@ -29,18 +44,30 @@ HERMES_UID=\$(id -u hermes)
 runuser -u hermes -- env \\
   HOME=/srv/hermes \\
   XDG_RUNTIME_DIR=/run/user/\$HERMES_UID \\
+  HERMES_KEY_NAME=${quoted_name} \\
   PATH=/srv/hermes/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\
-  bash -c 'set -eu; read -r v; "\$HOME/.local/bin/hermes" config set "\$0" "\$v"' ${quoted_name} <<<"\$v"
+  bash -c '
+set -eu
+read -r v
+ENV_FILE="\$HOME/.hermes/.env"
+[ -f "\$ENV_FILE" ] || { echo ".env missing — run hermes-install.sh first" >&2; exit 1; }
+# Idempotent upsert: drop any existing (commented or live) line for this
+# key, then append a fresh KEY=value. mv is atomic on the same FS, so
+# .env is never observed half-written.
+tmp=\$(mktemp -p "\$HOME/.hermes" .env.XXXXXX)
+chmod 0600 "\$tmp"
+grep -vE "^[[:space:]]*#?[[:space:]]*\$HERMES_KEY_NAME[[:space:]]*=" "\$ENV_FILE" > "\$tmp" || true
+printf "%s=%s\\n" "\$HERMES_KEY_NAME" "\$v" >> "\$tmp"
+mv "\$tmp" "\$ENV_FILE"
+' <<<"\$v"
 EOS
 )
 
-# stdout goes to /dev/null because hermes' success line echoes the value
-# verbatim ("✓ Set OPENROUTER_API_KEY = sk-or-v1-…"), which would defeat
-# the silent `read -rsp` we just used. stderr is left intact so genuine
-# errors still surface; the exit code is what we trust.
+# stderr is preserved; stdout suppressed in case any inner command leaks
+# the value. Trust the exit code.
 if ! printf '%s\n' "$value" | limactl shell "${HERMES_VM_NAME}" -- sudo bash -c "$script" >/dev/null; then
   echo "failed to store ${name}" >&2
   exit 1
 fi
 
-echo "stored ${name} in /srv/hermes/.hermes/config.yaml (hermes-owned, encrypted ZFS)."
+echo "stored ${name} in /srv/hermes/.hermes/.env (mode 0600, hermes-owned, encrypted ZFS)."
