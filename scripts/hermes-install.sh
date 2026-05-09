@@ -68,6 +68,18 @@ fi
 # arbitrary keys without validation, so a wrong key writes a dead top-level
 # entry the runtime ignores. Verify with `hermes config show` (Backend: docker).
 "$HOME/.local/bin/hermes" config set terminal.backend docker
+
+# Upstream installer's `npx playwright install --with-deps chromium` dies
+# silently here: --with-deps tries to apt-install system libs and SUDO_ASKPASS
+# refuses the prompt. The libs are already present (ubuntu-hermes.yaml pre-
+# installs libnss3, libatk1.0-0, libcups2, etc.), so just fetching the browser
+# binary without --with-deps is enough. Idempotent — playwright skips browsers
+# it has already cached under ~/.cache/ms-playwright/.
+HERMES_AGENT_DIR="$HOME/.hermes/hermes-agent"
+NODE_BIN="$HOME/.hermes/node/bin"
+if [ -d "$HERMES_AGENT_DIR" ] && [ -x "$NODE_BIN/npx" ]; then
+  ( cd "$HERMES_AGENT_DIR" && PATH="$NODE_BIN:$PATH" "$NODE_BIN/npx" playwright install chromium )
+fi
 INNER_EOS
 OUTER_EOS
 
