@@ -45,6 +45,7 @@ provisioning.
     - [hermes-gateway.service fails immediately (stale lock)](#hermes-gateway-service-fails-to-start-immediately-exit-code-after-1-second)
     - [hermes-gateway.service pre-check hangs 30 s (%U bug)](#hermes-gateway-service-pre-check-hangs-for-30-seconds-then-fails)
     - [OpenRouter 429 — is my API key missing?](#openrouter-429-add-your-own-key--is-the-api-key-missing)
+    - [Slack bot never responds (Socket Mode disabled)](#slack-bot-connected-but-never-responds-to-messages)
     - [Agent advises editing config.yaml for secrets](#hermes-agent-gives-advice-about-editing-configyaml-for-slack--api-keys)
     - [Agent asks for sudo password](#hermes-agent-asks-for-the-sudo-password)
     - [Agent diagnoses wrong config files](#hermes-agent-diagnoses-the-wrong-config-files-wrong-user-context)
@@ -633,6 +634,41 @@ Always use the `:free` suffix when picking a free OpenRouter model (e.g.
 `qwen/qwen3-coder:free`). The meta-router id `openrouter/free` is **not**
 strictly free — it routes to paid models if the account has any credits and
 will produce 402 errors when the credit limit is hit.
+
+#### Slack bot connected but never responds to messages
+
+Symptom: `hermes status` shows `Slack ✓ configured`, gateway is `active
+(running)`, Slack tokens pass `auth.test`, but @mentions and DMs produce
+no response and nothing appears in `journalctl -u hermes-gateway.service`.
+
+Root cause: **Socket Mode is disabled** in the Slack app settings. Without
+it, Slack has nowhere to deliver events and the gateway receives nothing.
+
+Fix — in `api.slack.com/apps → <your app> → Socket Mode`: toggle
+**Enable Socket Mode** on.
+
+While there, confirm under **Event Subscriptions → Subscribe to bot events**
+that at minimum these two events are listed:
+
+| Event | Purpose |
+| --- | --- |
+| `app_mention` | @mentions in channels |
+| `message.im` | Direct messages to the bot |
+
+And under **OAuth & Permissions → Bot Token Scopes** that the bot has:
+
+| Scope | Purpose |
+| --- | --- |
+| `app_mentions:read` | Receive `app_mention` events |
+| `users:read` | Resolve Slack usernames for `SLACK_ALLOWED_USERS` |
+
+After any scope change, reinstall the app (yellow banner), store the new
+bot token, and restart the gateway:
+
+```bash
+./scripts/hermes-config.sh          # SLACK_BOT_TOKEN → new xoxb-...
+./scripts/hermes-gateway.sh restart
+```
 
 #### Hermes agent gives advice about editing `config.yaml` for Slack / API keys
 
