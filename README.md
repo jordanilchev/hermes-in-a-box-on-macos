@@ -46,6 +46,7 @@ provisioning.
     - [hermes-gateway.service pre-check hangs 30 s (%U bug)](#hermes-gateway-service-pre-check-hangs-for-30-seconds-then-fails)
     - [OpenRouter 429 — is my API key missing?](#openrouter-429-add-your-own-key--is-the-api-key-missing)
     - [Slack bot never responds (Socket Mode disabled)](#slack-bot-connected-but-never-responds-to-messages)
+    - [Slack bot rejects your messages (Unauthorized user)](#slack-bot-receives-messages-but-rejects-them-unauthorized-user)
     - [Agent advises editing config.yaml for secrets](#hermes-agent-gives-advice-about-editing-configyaml-for-slack--api-keys)
     - [Agent asks for sudo password](#hermes-agent-asks-for-the-sudo-password)
     - [Agent diagnoses wrong config files](#hermes-agent-diagnoses-the-wrong-config-files-wrong-user-context)
@@ -669,6 +670,35 @@ bot token, and restart the gateway:
 ./scripts/hermes-config.sh          # SLACK_BOT_TOKEN → new xoxb-...
 ./scripts/hermes-gateway.sh restart
 ```
+
+#### Slack bot receives messages but rejects them (Unauthorized user)
+
+Symptom: Socket Mode is on, gateway is running, but every message produces
+`WARNING gateway.run: Unauthorized user: UXXXXXXXXX (your-name) on slack`
+in the journal and the bot stays silent.
+
+Root cause: `SLACK_ALLOWED_USERS` in `.env` contains a display name (e.g.
+`jordan`) but the gateway filters by **Slack user ID** (the `U...` UID).
+Display names can change; UIDs are stable — so hermes always compares
+against the UID and rejects anything not in the allowlist.
+
+Fix — copy your UID from the log line (`Unauthorized user: U084TB77N59
+(jordan)` → `U084TB77N59`) and update the allowlist:
+
+```bash
+./scripts/hermes-env-edit.sh
+# change: SLACK_ALLOWED_USERS=jordan
+# to:     SLACK_ALLOWED_USERS=U084TB77N59
+```
+
+Then restart:
+
+```bash
+./scripts/hermes-gateway.sh restart
+```
+
+To add multiple users, check whether your version of hermes expects a
+comma-separated list or repeated env vars (`SLACK_ALLOWED_USERS_1=...`).
 
 #### Hermes agent gives advice about editing `config.yaml` for Slack / API keys
 
