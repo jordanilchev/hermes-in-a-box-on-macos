@@ -341,9 +341,10 @@ provision:
       # ProtectSystem=strict, PrivateTmp): empty CapabilityBoundingSet so the
       # unit can never gain CAP_NET_ADMIN (UFW) or CAP_NET_BIND_SERVICE (port
       # 22 hijack); MemoryDenyWriteExecute; SystemCallFilter=@system-service.
-      # Environment uses %U specifier — expands to hermes's UID at start time
-      # so the rootless-docker socket path is correct regardless of which UID
-      # useradd -r assigned.
+      # %U in Environment= expands in the system (root) context, resolving to
+      # UID 0 instead of hermes's UID. Hardcode 999 (the stable UID assigned
+      # by useradd -r from the user-creation step) and use `id -u hermes` in
+      # ExecStartPre so the socket path is resolved at exec time, not parse time.
       set -eux -o pipefail
       cat > /etc/systemd/system/hermes-gateway.service <<'EOF'
       [Unit]
@@ -356,10 +357,10 @@ provision:
       User=hermes
       Group=hermes
       Environment=HOME=/srv/hermes
-      Environment=XDG_RUNTIME_DIR=/run/user/%U
-      Environment=DOCKER_HOST=unix:///run/user/%U/docker.sock
+      Environment=XDG_RUNTIME_DIR=/run/user/999
+      Environment=DOCKER_HOST=unix:///run/user/999/docker.sock
       Environment=PATH=/srv/hermes/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      ExecStartPre=/bin/sh -c 'i=0; until test -S "$XDG_RUNTIME_DIR/docker.sock"; do i=$((i+1)); [ $i -ge 30 ] && exit 1; sleep 1; done'
+      ExecStartPre=/bin/sh -c 'uid=$(id -u hermes); i=0; until test -S "/run/user/$uid/docker.sock"; do i=$((i+1)); [ $i -ge 30 ] && exit 1; sleep 1; done'
       ExecStart=/srv/hermes/.local/bin/hermes gateway
       Restart=on-failure
       RestartSec=5
