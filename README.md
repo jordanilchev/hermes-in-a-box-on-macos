@@ -42,6 +42,12 @@ provisioning.
   - [Daily use](#daily-use)
   - [Snapshot strategy](#snapshot-strategy)
   - [Troubleshooting](#troubleshooting)
+    - [hermes-gateway.service fails immediately (stale lock)](#hermes-gateway-service-fails-to-start-immediately-exit-code-after-1-second)
+    - [hermes-gateway.service pre-check hangs 30 s (%U bug)](#hermes-gateway-service-pre-check-hangs-for-30-seconds-then-fails)
+    - [OpenRouter 429 — is my API key missing?](#openrouter-429-add-your-own-key--is-the-api-key-missing)
+    - [Agent advises editing config.yaml for secrets](#hermes-agent-gives-advice-about-editing-configyaml-for-slack--api-keys)
+    - [Agent asks for sudo password](#hermes-agent-asks-for-the-sudo-password)
+    - [Agent diagnoses wrong config files](#hermes-agent-diagnoses-the-wrong-config-files-wrong-user-context)
 - [E. Appendix: install prerequisites](#e-appendix-install-prerequisites)
 
 ---
@@ -134,6 +140,12 @@ the same scripts work on any machine that meets the prerequisites.
 | [`keyfile-backup.sh`](./scripts/keyfile-backup.sh) | Export the ZFS encryption keyfile to base64 outside the VM. |
 | [`keyfile-restore.sh`](./scripts/keyfile-restore.sh) | Restore the keyfile after a factory-reset. |
 | [`destroy.sh`](./scripts/destroy.sh) | DESTRUCTIVE: tear down VM and tank disk (with confirmation). |
+| [`hermes-install.sh`](./scripts/hermes-install.sh) | One-time: set up rootless dockerd for the `hermes` user, install the Hermes Agent binary, configure `terminal.backend=docker`. Idempotent. |
+| [`hermes-config.sh`](./scripts/hermes-config.sh) | Prompt for an API key name and value; upsert into `/srv/hermes/.hermes/.env` via stdin — value never appears in `ps` or on host disk. |
+| [`hermes-env-edit.sh`](./scripts/hermes-env-edit.sh) | Open `/srv/hermes/.hermes/.env` in `$EDITOR` (vi/vim/nano/emacs) inside the VM as the `hermes` user. Preserves ownership and 0600 mode. |
+| [`hermes-gateway.sh`](./scripts/hermes-gateway.sh) | Manage `hermes-gateway.service` (start / stop / restart / status / logs / enable / disable). |
+| [`hermes.sh`](./scripts/hermes.sh) | Run any `hermes` subcommand as the `hermes` user inside the VM (e.g. `./scripts/hermes.sh chat`). |
+| [`list-free-models.sh`](./scripts/list-free-models.sh) | Query OpenRouter live for free models that support tool use; prints model ID and context length. |
 
 ### Configuration
 
@@ -289,17 +301,47 @@ UFW, hermes cannot read `/etc/zfs/tank.key`.
 ### Daily use
 
 ```bash
-./scripts/shell.sh                                       # interactive shell
-./scripts/shell.sh -- sudo -iu hermes docker ps          # rootless docker as hermes
-./scripts/hermes.sh chat                                 # interactive Hermes session
-./scripts/hermes-gateway.sh status                       # gateway daemon state
+# VM lifecycle
+./scripts/start.sh                                       # resume the VM
 ./scripts/stop.sh                                        # power down (preserves state)
-./scripts/start.sh                                       # resume
+./scripts/shell.sh                                       # interactive shell as root
+./scripts/shell.sh -- sudo -iu hermes docker ps          # rootless docker as hermes
+
+# Hermes Agent
+./scripts/hermes.sh chat                                 # interactive chat session
+./scripts/hermes.sh --version                            # print agent version
+./scripts/hermes.sh config show                          # show current config
+./scripts/hermes.sh status                               # API keys, gateway, platforms
+./scripts/hermes-gateway.sh status                       # gateway daemon state
+./scripts/hermes-gateway.sh start                        # start gateway daemon
+./scripts/hermes-gateway.sh restart                      # restart (picks up .env changes)
+./scripts/hermes-gateway.sh logs                         # follow daemon logs
+./scripts/hermes-gateway.sh stop                         # stop daemon
+
+# Configuration and secrets
+./scripts/hermes-config.sh                               # upsert a key into .env (prompted)
+./scripts/hermes-env-edit.sh                             # open .env in $EDITOR inside the VM
+./scripts/list-free-models.sh                            # list free OpenRouter models with tool support
+
+# Model selection (use :free suffix for actually-free OpenRouter models)
+./scripts/hermes.sh model                                # interactive model picker
+./scripts/shell.sh -- sudo runuser -u hermes -- env HOME=/srv/hermes \
+  PATH=/srv/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin \
+  /srv/hermes/.local/bin/hermes config set model.default qwen/qwen3-coder:free
+
+# Snapshots
+./scripts/shell.sh -- sudo zfs snapshot -r tank@before-experiment-$(date +%Y%m%d)
+./scripts/backup.sh                                      # full APFS clone of VM + data disk
 ```
 
 `HERMES_VM_HOME` (and therefore `LIMA_HOME`) must be set in every shell
-that talks to the VM. Persist it in your shell rc as shown in
-[Configuration](#configuration).
+that talks to the VM. Persist both in your shell rc:
+
+```bash
+# bash
+echo 'export HERMES_VM_HOME="/path/to/apfs/volume/hermes-vm"' >> ~/.bashrc
+echo 'export LIMA_HOME="$HERMES_VM_HOME/lima"' >> ~/.bashrc
+```
 
 ### Snapshot strategy
 
@@ -515,6 +557,153 @@ tail -F "${LIMA_HOME}/${HERMES_VM_NAME:-ubuntu-hermes}/serial.log"
 ./scripts/shell.sh -- sudo journalctl -u hermes-gateway --no-pager
 ./scripts/shell.sh -- sudo -iu hermes journalctl --user -u docker --no-pager   # rootless dockerd
 ```
+
+#### `hermes-gateway.service` fails to start immediately (exit-code after ~1 second)
+
+Symptom: `systemctl status hermes-gateway.service` shows the main process
+exiting with `status=1/FAILURE` within a second of starting — no 30-second
+pre-check timeout.
+
+The `ExecStartPre` pre-check passed but `hermes gateway` exited with:
+
+```
+❌ Gateway already running (PID <N>).
+   Use 'hermes gateway restart' to replace it, or 'hermes gateway stop' to kill it first.
+```
+
+Root cause: a previous manually-started gateway process (e.g. from a
+debugging session) is still running and holding the lock. The service's
+restart loop keeps failing against it.
+
+Fix:
+
+```bash
+# Find and kill the stale process
+./scripts/shell.sh -- sudo bash -c 'pkill -u hermes -f "hermes gateway" || true'
+./scripts/hermes-gateway.sh start
+```
+
+#### `hermes-gateway.service` pre-check hangs for 30 seconds then fails
+
+Symptom: `journalctl -u hermes-gateway.service` shows the service starting,
+waiting ~30 seconds, then `ExecStartPre` exiting with `status=1/FAILURE`.
+The `ExecStart` line never appears.
+
+Root cause: systemd's `%U` specifier in `Environment=` lines resolves in the
+system (root) context, yielding UID 0, not the UID of `User=hermes`. The
+pre-check therefore tests `/run/user/0/docker.sock`, which does not exist.
+This bug is fixed in `ubuntu-hermes.yaml` (hardcoded UID 999 and `id -u
+hermes` at exec time). If the live service file pre-dates the fix, apply it
+manually:
+
+```bash
+./scripts/shell.sh -- sudo sed -i \
+  's|/run/user/%U|/run/user/999|g' \
+  /etc/systemd/system/hermes-gateway.service
+./scripts/shell.sh -- sudo sed -i \
+  "s|until test -S \"\\\$XDG_RUNTIME_DIR/docker.sock\"|until test -S \"/run/user/\$(id -u hermes)/docker.sock\"|" \
+  /etc/systemd/system/hermes-gateway.service
+./scripts/shell.sh -- sudo systemctl daemon-reload
+./scripts/hermes-gateway.sh start
+```
+
+#### OpenRouter 429 "add your own key" — is the API key missing?
+
+A 429 response with the message `add your own key to accumulate your rate
+limits` does **not** mean the `OPENROUTER_API_KEY` is absent or wrong. A
+missing key produces 401. The 429 means the specific free-tier model's
+inference pool is exhausted upstream.
+
+Verify the key is loaded and check the current model:
+
+```bash
+./scripts/hermes.sh status   # shows "OpenRouter ✓ sk-o..." when key is present
+```
+
+If the key is present but requests keep 429-ing, the configured model's free
+capacity is gone. Switch to a model that is currently available:
+
+```bash
+./scripts/list-free-models.sh                            # live list, changes as sponsors rotate
+./scripts/hermes.sh config set model.default <model-id>:free
+./scripts/hermes-gateway.sh restart
+```
+
+Always use the `:free` suffix when picking a free OpenRouter model (e.g.
+`qwen/qwen3-coder:free`). The meta-router id `openrouter/free` is **not**
+strictly free — it routes to paid models if the account has any credits and
+will produce 402 errors when the credit limit is hit.
+
+#### Hermes agent gives advice about editing `config.yaml` for Slack / API keys
+
+Ignore it. `config.yaml` is for non-secret runtime config (model, terminal
+backend, personalities). Secrets (`OPENROUTER_API_KEY`, `SLACK_BOT_TOKEN`,
+`SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET`, etc.) belong exclusively in
+`/srv/hermes/.hermes/.env`. The runtime reads them from there via `hermes
+config env-path`. Anything written to `config.yaml` via `hermes config set`
+for a key that belongs in `.env` is silently ignored by the runtime.
+
+To add or update a secret:
+
+```bash
+./scripts/hermes-config.sh          # prompted; value is never echoed or written to host disk
+# or, to edit .env directly:
+./scripts/hermes-env-edit.sh
+```
+
+After updating `.env`, restart the gateway:
+
+```bash
+./scripts/hermes-gateway.sh restart
+```
+
+This also applies to Slack: Socket Mode (the `xapp-` app-level token)
+requires no public URL and no webhook. Only `SLACK_BOT_TOKEN`,
+`SLACK_APP_TOKEN`, and `SLACK_SIGNING_SECRET` in `.env` are needed. No
+`gateway.platforms.slack` section in `config.yaml` is required.
+
+#### Hermes agent asks for the sudo password
+
+The `hermes` user has no sudo access and never will. It is not in the
+`sudo` or `wheel` group. No password exists that would satisfy the prompt —
+`sudo` will reject any input unconditionally.
+
+If the agent needs a privileged operation done, deny the sudo request and
+describe what specific command needs to run. Then execute it yourself:
+
+```bash
+./scripts/shell.sh -- sudo <command>
+```
+
+You can also give the agent this standing instruction to avoid repeat
+prompts:
+
+> You do not have sudo access and never will. Your user (`hermes`) is
+> deliberately unprivileged — not in the sudo or wheel group. There is no
+> password to provide. If you need a privileged operation done, ask the
+> human to run it for you.
+
+#### Hermes agent diagnoses the wrong config files (wrong user context)
+
+Symptom: a `hermes chat` session reports that `SLACK_BOT_TOKEN` is empty,
+`.env` is missing, or `hermes` is not in PATH — even though `hermes status`
+on the host shows everything configured.
+
+Root cause: the agent ran a shell command that resolved to the *calling*
+user's home directory (e.g. `/home/<your-username>/.hermes/`) instead of
+the `hermes` user's home at `/srv/hermes/.hermes/`. Commands like `cat
+~/.hermes/.env` in agent tool calls go to the wrong path.
+
+The correct locations are:
+
+| Resource | Path |
+| --- | --- |
+| `.env` (secrets) | `/srv/hermes/.hermes/.env` |
+| `config.yaml` | `/srv/hermes/.hermes/config.yaml` |
+| `hermes` binary | `/srv/hermes/.local/bin/hermes` |
+
+When instructing the agent to read or write config, always use absolute
+paths under `/srv/hermes/`.
 
 #### I want to disable the VM and free its resources without deleting it
 
