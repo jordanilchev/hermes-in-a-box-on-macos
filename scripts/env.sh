@@ -22,14 +22,31 @@
 
 (return 0 2>/dev/null) || set -eu
 
+# Cursor/minimal shells often leave LANG/LC_CTYPE empty; bash then warns on
+# every invocation: "setlocale: LC_CTYPE: cannot change locale ()".
+if [ -z "${LANG:-}" ] || [ -z "${LC_CTYPE:-}" ]; then
+  if locale -a 2>/dev/null | grep -qx 'en_US.UTF-8'; then
+    : "${LANG:=en_US.UTF-8}"
+  elif locale -a 2>/dev/null | grep -qx 'C.UTF-8'; then
+    : "${LANG:=C.UTF-8}"
+  else
+    : "${LANG:=C}"
+  fi
+  : "${LC_CTYPE:=${LANG}}"
+  export LANG LC_CTYPE
+fi
+
 : "${HERMES_VM_HOME:=${HOME}/hermes-vm-data}"
 : "${LIMA_HOME:=${HERMES_VM_HOME}/lima}"
 : "${HERMES_VM_NAME:=ubuntu-hermes}"
+: "${HERMES_SHELL_SESSION:=hermes-vm}"
+: "${HERMES_HOST_SHELL_SESSION:=hermes-host}"
 
 # Resolve the repo root from this script's location: scripts/env.sh -> ..
 HERMES_VM_REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 
-export HERMES_VM_HOME LIMA_HOME HERMES_VM_NAME HERMES_VM_REPO
+export HERMES_VM_HOME LIMA_HOME HERMES_VM_NAME HERMES_VM_REPO \
+  HERMES_SHELL_SESSION HERMES_HOST_SHELL_SESSION
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
