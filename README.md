@@ -134,7 +134,8 @@ the same scripts work on any machine that meets the prerequisites.
 | --- | --- |
 | [`setup.sh`](./scripts/setup.sh) | First-time setup: storage layout, pre-create tank disk, start VM. Idempotent. |
 | [`verify.sh`](./scripts/verify.sh) | Run all hardening checks. Exit 0 on full pass. |
-| [`shell.sh`](./scripts/shell.sh) | Open an interactive shell in the VM, or run a one-off command. |
+| [`shell.sh`](./scripts/shell.sh) | Open an interactive shell in the VM, or run a one-off command. Interactive mode uses a persistent host **tmux** session (survives SSH disconnect). |
+| [`host-shell-setup.sh`](./scripts/host-shell-setup.sh) | One-time: auto-attach **tmux** on SSH login to the Mac host so remote shells resume after disconnect. |
 | [`start.sh`](./scripts/start.sh) | Resume the VM. |
 | [`stop.sh`](./scripts/stop.sh) | Power down the VM (preserves state). |
 | [`backup.sh`](./scripts/backup.sh) | Cold-copy backup of disk + datadisk + lima.yaml using APFS clonefile. |
@@ -142,10 +143,13 @@ the same scripts work on any machine that meets the prerequisites.
 | [`keyfile-backup.sh`](./scripts/keyfile-backup.sh) | Export the ZFS encryption keyfile to base64 outside the VM. |
 | [`keyfile-restore.sh`](./scripts/keyfile-restore.sh) | Restore the keyfile after a factory-reset. |
 | [`destroy.sh`](./scripts/destroy.sh) | DESTRUCTIVE: tear down VM and tank disk (with confirmation). |
-| [`hermes-install.sh`](./scripts/hermes-install.sh) | One-time: set up rootless dockerd for the `hermes` user, install the Hermes Agent binary, configure `terminal.backend=docker`. Idempotent. |
+| [`hermes-install.sh`](./scripts/hermes-install.sh) | One-time: install Hermes Agent from PyPI into a `uv`-managed venv at `~/.hermes/venv/`, set up rootless dockerd, configure `terminal.backend=docker`. Idempotent. |
+| [`hermes-update.sh`](./scripts/hermes-update.sh) | Upgrade (or pin) the Hermes Agent PyPI version: `./scripts/hermes-update.sh 0.16.0`. No-ops if already at target. Agent state/config/memory survive. |
 | [`hermes-config.sh`](./scripts/hermes-config.sh) | Prompt for an API key name and value; upsert into `/srv/hermes/.hermes/.env` via stdin — value never appears in `ps` or on host disk. |
 | [`hermes-env-edit.sh`](./scripts/hermes-env-edit.sh) | Open `/srv/hermes/.hermes/.env` in `$EDITOR` (vi/vim/nano/emacs) inside the VM as the `hermes` user. Preserves ownership and 0600 mode. |
 | [`hermes-gateway.sh`](./scripts/hermes-gateway.sh) | Manage `hermes-gateway.service` (start / stop / restart / status / logs / enable / disable). |
+| [`hermes-gemma-local.sh`](./scripts/hermes-gemma-local.sh) | **Default LLM backend:** host Ollama with Gemma 4 12B QAT (`gemma4-hermes` alias, 64K ctx). Subcommands: `setup`, `start/stop/status/logs`, `enable-hermes`, `purge-vm`, `test`. Stops in-VM Ollama and Cursor proxy. |
+| [`hermes-cursor-proxy.sh`](./scripts/hermes-cursor-proxy.sh) | *(Legacy)* Cursor Agent API proxy (`hermes-cursor-proxy.service`, port 4646). Not used when `hermes-gemma-local.sh setup` is active. |
 | [`hermes.sh`](./scripts/hermes.sh) | Run any `hermes` subcommand as the `hermes` user inside the VM (e.g. `./scripts/hermes.sh chat`). |
 | [`list-free-models.sh`](./scripts/list-free-models.sh) | Query OpenRouter live for free models that support tool use; prints model ID and context length. |
 
@@ -159,6 +163,14 @@ All scripts source [`scripts/env.sh`](./scripts/env.sh), which respects:
 | `LIMA_HOME` | `${HERMES_VM_HOME}/lima` | Lima's instance directory. |
 | `HERMES_VM_NAME` | `ubuntu-hermes` | Lima instance name. |
 | `TANK_SIZE` | `200GiB` | Size of the encrypted data disk (used by `setup.sh` only on first run). |
+| `HERMES_VERSION` | (pinned in `env.sh`) | PyPI version passed to `hermes-install.sh` and `hermes-update.sh`. Override on the command line: `HERMES_VERSION=0.16.0 ./scripts/hermes-update.sh`. |
+| `GEMMA_BASE_MODEL` | `gemma4:12b-it-qat` | Ollama weights pulled by `hermes-gemma-local.sh`. |
+| `GEMMA_MODEL` | `gemma4-hermes` | Local Ollama alias (base model + `num_ctx`); Hermes routes here. |
+| `LOCAL_LLM_PORT` | `11435` | Host Ollama port (11434 is reserved for Lima's in-VM forward). |
+| `LOCAL_LLM_CONTEXT` | `65536` | Context window for Hermes 0.16+ tool use (requires ≥64K). |
+| `HERMES_SHELL_SESSION` | `hermes-vm` | Host tmux session name used by interactive `shell.sh`. |
+| `HERMES_HOST_SHELL_SESSION` | `hermes-host` | Host tmux session name for SSH logins (after `host-shell-setup.sh install`). |
+| `HERMES_SHELL_TMUX` | `1` | Set to `0` to disable host tmux wrapping in `shell.sh`. |
 
 Set `HERMES_VM_HOME` to your APFS volume (external SSD strongly recommended)
 and persist it in your shell rc:
@@ -257,19 +269,23 @@ defense-in-depth layers between agent-emitted commands and the host's
 hardening.
 
 ```bash
-./scripts/hermes-install.sh              # one-time: rootless docker + hermes binary
+./scripts/hermes-install.sh              # one-time: rootless docker + hermes binary (PyPI)
 ./scripts/hermes-config.sh               # set an API key (prompted, never on host disk)
 ./scripts/hermes-gateway.sh start        # start the long-running daemon (optional)
 ./scripts/hermes.sh chat                 # interactive
 ./scripts/hermes-gateway.sh logs         # follow daemon logs
 ```
 
-`hermes-install.sh` is idempotent — it sets up rootless dockerd for the
-`hermes` user, runs the upstream installer (only if `~/.local/bin/hermes`
-is missing), and configures `terminal.backend=docker` so every tool call
-runs inside a rootless container. `hermes-config.sh` prompts for a key
-name (default `OPENROUTER_API_KEY`) and value; the value is piped via
-stdin so it is never visible in `ps`.
+`hermes-install.sh` is idempotent — it installs the pinned `HERMES_VERSION` from
+PyPI into a `uv`-managed venv at `~/.hermes/venv/` and creates a shim at
+`~/.local/bin/hermes`. To upgrade to a newer release:
+
+```bash
+./scripts/hermes-update.sh 0.16.0        # upgrade in-place; state/config/memory preserved
+```
+
+`hermes-config.sh` prompts for a key name (default `OPENROUTER_API_KEY`) and
+value; the value is piped via stdin so it is never visible in `ps`.
 
 The gateway daemon is shipped disabled. After setting an API key, start
 it manually with `./scripts/hermes-gateway.sh start`. Logs follow with
@@ -325,11 +341,14 @@ UFW, hermes cannot read `/etc/zfs/tank.key`.
 ./scripts/hermes-env-edit.sh                             # open .env in $EDITOR inside the VM
 ./scripts/list-free-models.sh                            # list free OpenRouter models with tool support
 
-# Model selection (use :free suffix for actually-free OpenRouter models)
-./scripts/hermes.sh model                                # interactive model picker
-./scripts/shell.sh -- sudo runuser -u hermes -- env HOME=/srv/hermes \
-  PATH=/srv/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin \
-  /srv/hermes/.local/bin/hermes config set model.default qwen/qwen3-coder:free
+# Upgrading the agent
+./scripts/hermes-update.sh 0.16.0                        # upgrade to a specific PyPI version
+
+# Local LLM (Gemma 4 12B QAT on host — recommended)
+./scripts/hermes-gemma-local.sh setup                    # one-shot: install Ollama, pull model, purge cloud backends, enable
+./scripts/hermes-gemma-local.sh status                   # host Ollama + Hermes routing
+./scripts/hermes-gemma-local.sh test                     # smoke test VM → host inference
+./scripts/hermes-gemma-local.sh start                    # start host Ollama after reboot
 
 # Snapshots
 ./scripts/shell.sh -- sudo zfs snapshot -r tank@before-experiment-$(date +%Y%m%d)
@@ -829,6 +848,27 @@ brew install jq
 ```
 
 Used by some validation commands and by future scripts in this repo.
+
+### tmux (recommended for interactive `shell.sh`)
+
+```bash
+brew install tmux
+```
+
+Interactive `./scripts/shell.sh` attaches to a host tmux session named
+`hermes-vm` (override with `HERMES_SHELL_SESSION`). If your SSH session
+drops, re-run `./scripts/shell.sh` from the repo to reattach. One-off
+commands (`./scripts/shell.sh -- …`) bypass tmux.
+
+To resume **any** SSH login on the Mac host (not just the VM shell):
+
+```bash
+./scripts/host-shell-setup.sh install
+```
+
+That adds a small snippet to your shell rc. New SSH sessions auto-attach
+to tmux session `hermes-host` (`HERMES_HOST_SHELL_SESSION`). Uninstall
+with `./scripts/host-shell-setup.sh uninstall`.
 
 ### Optional: external SSD
 
