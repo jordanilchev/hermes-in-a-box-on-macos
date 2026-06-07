@@ -700,7 +700,7 @@ was working and stopped after a VM rebuild.
 
 Cold-loading `gemma4-hermes` with 64K context on a 16 GiB Mac can take
 2–3 minutes. Subsequent requests are faster while Ollama keeps the model
-loaded (`OLLAMA_KEEP_ALIVE`, default 10m).
+loaded (`OLLAMA_KEEP_ALIVE`, default 24h).
 
 #### OpenRouter 429 "add your own key" — is the API key missing?
 

@@ -25,7 +25,7 @@ set -eu
 : "${LOCAL_LLM_PORT:=11435}"
 : "${LOCAL_LLM_HOST:=host.lima.internal}"
 : "${LOCAL_LLM_CONTEXT:=65536}"
-: "${OLLAMA_KEEP_ALIVE:=10m}"
+: "${OLLAMA_KEEP_ALIVE:=24h}"
 
 LOCAL_LLM_BASE_URL="http://${LOCAL_LLM_HOST}:${LOCAL_LLM_PORT}/v1"
 
