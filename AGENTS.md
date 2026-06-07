@@ -41,9 +41,12 @@ README.md                 # Operations manual
 - `HERMES_VM_HOME` — host-side root for all VM state (default: `$HOME/hermes-vm-data`)
 - `LIMA_HOME` — `$HERMES_VM_HOME/lima`
 - `HERMES_VM_NAME` — Lima instance name (default: `ubuntu-hermes`)
-- `HERMES_VERSION` — pinned PyPI version for `hermes-install.sh` / `hermes-update.sh`
-- `GEMMA_MODEL` — Ollama alias Hermes uses (default: `gemma4-hermes`)
+- `HERMES_VERSION` — pinned PyPI version (default: `0.16.0`)
+- `GEMMA_BASE_MODEL` — Ollama weights tag to pull (default: `gemma4:12b-it-qat`)
+- `GEMMA_MODEL` — local alias Hermes routes to (default: `gemma4-hermes`)
 - `LOCAL_LLM_PORT` — host Ollama port (default: `11435`)
+- `LOCAL_LLM_CONTEXT` — Ollama/Hermes context window (default: `65536`)
+- `HERMES_SHELL_SESSION` / `HERMES_HOST_SHELL_SESSION` — tmux session names
 
 ## Provisioning
 `ubuntu-hermes.yaml` contains ordered cloud-init `provision:` blocks (system mode), all idempotent. Covers: apt upgrades, SSH hardening, DNS, ZFS, rootless Docker, `hermes` user, systemd units, UFW.

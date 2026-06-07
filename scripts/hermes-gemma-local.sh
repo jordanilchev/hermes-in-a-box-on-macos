@@ -2,7 +2,7 @@
 # Host-side Gemma 4 12B QAT inference for Hermes (single local LLM backend).
 #
 # Inference runs on the Mac host (Metal GPU via Ollama). The Lima VM reaches
-# the host at host.lima.internal:11434. Cloud backends (OpenRouter, Cursor) and
+# the host at host.lima.internal:11435. Cloud backends (OpenRouter, Cursor) and
 # the in-VM Ollama install are stopped/disabled by `setup`.
 #
 # Model: gemma4-hermes (local alias over gemma4:12b-it-qat with num_ctx 65536).

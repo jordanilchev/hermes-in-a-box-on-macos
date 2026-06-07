@@ -8,9 +8,9 @@ provisioning.
 
 > **Note for AI agents:** If you are an AI coding agent (Claude Code or
 > similar) reading this to extend or troubleshoot the setup, start with
-> [`ubuntu-hermes.yaml`](./ubuntu-hermes.yaml) — the single source of truth
-> for provisioning — and the wrappers under [`scripts/`](./scripts/). Then
-> read [Section D Troubleshooting](#troubleshooting) before making any
+> [`AGENTS.md`](./AGENTS.md) and [`ubuntu-hermes.yaml`](./ubuntu-hermes.yaml)
+> — the single source of truth for provisioning — and the wrappers under
+> [`scripts/`](./scripts/). Then read [Section D Troubleshooting](#troubleshooting) before making any
 > changes. Hard constraints:
 >
 > 1. Do **not** run `limactl factory-reset` without first backing up
@@ -44,6 +44,7 @@ provisioning.
   - [Troubleshooting](#troubleshooting)
     - [hermes-gateway.service fails immediately (stale lock)](#hermes-gateway-service-fails-to-start-immediately-exit-code-after-1-second)
     - [hermes-gateway.service pre-check hangs 30 s (%U bug)](#hermes-gateway-service-pre-check-hangs-for-30-seconds-then-fails)
+    - [Local Ollama / Gemma inference fails](#local-ollama--gemma-inference-fails)
     - [OpenRouter 429 — is my API key missing?](#openrouter-429-add-your-own-key--is-the-api-key-missing)
     - [Slack bot never responds (Socket Mode disabled)](#slack-bot-connected-but-never-responds-to-messages)
     - [Slack bot rejects your messages (Unauthorized user)](#slack-bot-receives-messages-but-rejects-them-unauthorized-user)
@@ -85,9 +86,11 @@ forwarding). The stack is Lima 2.1.1 with the Apple Virtualization Framework
 (arm64), a 200 GiB encrypted ZFS pool (`tank`) holding three Hermes
 datasets (`tank/hermes`, `tank/hermes-var`, `tank/hermes-log`), no
 system Docker daemon (Hermes brings its own rootless dockerd, owned by
-the unprivileged `hermes` user), and UFW deny-all-by-default with an
+the unprivileged `hermes` user), host Ollama for local LLM inference
+(Gemma 4 12B QAT via `gemma4-hermes` on port 11435; the VM reaches the
+host at `host.lima.internal`), and UFW deny-all-by-default with an
 explicit allow-list (53/80/443/123 outbound, 22 inbound for `limactl
-shell`).
+shell`; host-Ollama egress is added at runtime by `hermes-gemma-local.sh`).
 
 ---
 
@@ -150,6 +153,7 @@ the same scripts work on any machine that meets the prerequisites.
 | [`hermes-gateway.sh`](./scripts/hermes-gateway.sh) | Manage `hermes-gateway.service` (start / stop / restart / status / logs / enable / disable). |
 | [`hermes-gemma-local.sh`](./scripts/hermes-gemma-local.sh) | **Default LLM backend:** host Ollama with Gemma 4 12B QAT (`gemma4-hermes` alias, 64K ctx). Subcommands: `setup`, `start/stop/status/logs`, `enable-hermes`, `purge-vm`, `test`. Stops in-VM Ollama and Cursor proxy. |
 | [`hermes-cursor-proxy.sh`](./scripts/hermes-cursor-proxy.sh) | *(Legacy)* Cursor Agent API proxy (`hermes-cursor-proxy.service`, port 4646). Not used when `hermes-gemma-local.sh setup` is active. |
+| [`hermes-model.sh`](./scripts/hermes-model.sh) | *(Legacy)* Interactive OpenRouter model picker; writes `model.default` and fallbacks to `config.yaml`. |
 | [`hermes.sh`](./scripts/hermes.sh) | Run any `hermes` subcommand as the `hermes` user inside the VM (e.g. `./scripts/hermes.sh chat`). |
 | [`list-free-models.sh`](./scripts/list-free-models.sh) | Query OpenRouter live for free models that support tool use; prints model ID and context length. |
 
@@ -163,7 +167,7 @@ All scripts source [`scripts/env.sh`](./scripts/env.sh), which respects:
 | `LIMA_HOME` | `${HERMES_VM_HOME}/lima` | Lima's instance directory. |
 | `HERMES_VM_NAME` | `ubuntu-hermes` | Lima instance name. |
 | `TANK_SIZE` | `200GiB` | Size of the encrypted data disk (used by `setup.sh` only on first run). |
-| `HERMES_VERSION` | (pinned in `env.sh`) | PyPI version passed to `hermes-install.sh` and `hermes-update.sh`. Override on the command line: `HERMES_VERSION=0.16.0 ./scripts/hermes-update.sh`. |
+| `HERMES_VERSION` | `0.16.0` | PyPI version passed to `hermes-install.sh` and `hermes-update.sh`. Override on the command line: `HERMES_VERSION=0.16.0 ./scripts/hermes-update.sh`. |
 | `GEMMA_BASE_MODEL` | `gemma4:12b-it-qat` | Ollama weights pulled by `hermes-gemma-local.sh`. |
 | `GEMMA_MODEL` | `gemma4-hermes` | Local Ollama alias (base model + `num_ctx`); Hermes routes here. |
 | `LOCAL_LLM_PORT` | `11435` | Host Ollama port (11434 is reserved for Lima's in-VM forward). |
@@ -217,7 +221,17 @@ already installed.
    > [the relevant troubleshooting entry](#limactl-start-hangs-for-10-minutes-then-exits-with-did-not-receive-running).
 
 After `setup.sh` returns, run [`verify.sh`](#verification) to confirm
-the security posture.
+the security posture. Then install Hermes and the local LLM backend:
+
+```bash
+./scripts/hermes-install.sh              # rootless docker + Hermes Agent (PyPI)
+./scripts/hermes-gemma-local.sh setup    # host Ollama, pull Gemma, route Hermes locally
+./scripts/hermes.sh chat -Q -q "hello"   # quick non-interactive smoke test
+```
+
+For cloud models (OpenRouter or Cursor) instead of local Gemma, see
+[Installing Hermes Agent](#installing-hermes-agent) and the legacy scripts
+`hermes-model.sh` / `hermes-cursor-proxy.sh`.
 
 ### Verification
 
@@ -270,10 +284,24 @@ hardening.
 
 ```bash
 ./scripts/hermes-install.sh              # one-time: rootless docker + hermes binary (PyPI)
-./scripts/hermes-config.sh               # set an API key (prompted, never on host disk)
-./scripts/hermes-gateway.sh start        # start the long-running daemon (optional)
+./scripts/hermes-gemma-local.sh setup    # recommended: host Ollama + Gemma 4 12B QAT
 ./scripts/hermes.sh chat                 # interactive
+./scripts/hermes-gateway.sh start        # optional: long-running daemon (Slack, etc.)
 ./scripts/hermes-gateway.sh logs         # follow daemon logs
+```
+
+`hermes-gemma-local.sh setup` installs host Ollama, pulls `gemma4:12b-it-qat`,
+creates a local `gemma4-hermes` alias with 64K context (required by Hermes
+0.16+), disables in-VM cloud/local LLM backends, and routes all Hermes model
+calls to `http://host.lima.internal:11435/v1`. No OpenRouter API key is
+needed for chat when this backend is active.
+
+For **cloud inference** instead, set an API key and pick a model:
+
+```bash
+./scripts/hermes-config.sh               # set OPENROUTER_API_KEY (prompted, never on host disk)
+./scripts/hermes-model.sh                # interactive OpenRouter model picker
+./scripts/hermes-gateway.sh start        # start the long-running daemon (optional)
 ```
 
 `hermes-install.sh` is idempotent — it installs the pinned `HERMES_VERSION` from
@@ -285,10 +313,12 @@ PyPI into a `uv`-managed venv at `~/.hermes/venv/` and creates a shim at
 ```
 
 `hermes-config.sh` prompts for a key name (default `OPENROUTER_API_KEY`) and
-value; the value is piped via stdin so it is never visible in `ps`.
+value; the value is piped via stdin so it is never visible in `ps`. Only
+needed when using OpenRouter or other cloud backends — not for local Gemma.
 
-The gateway daemon is shipped disabled. After setting an API key, start
-it manually with `./scripts/hermes-gateway.sh start`. Logs follow with
+The gateway daemon is shipped disabled. Start it manually when you need
+Slack, webhooks, or other always-on integrations:
+`./scripts/hermes-gateway.sh start`. Logs follow with
 `./scripts/hermes-gateway.sh logs`.
 
 **Layered sandbox**
@@ -628,6 +658,50 @@ manually:
 ./scripts/hermes-gateway.sh start
 ```
 
+#### Local Ollama / Gemma inference fails
+
+Symptoms include HTTP 500 from Ollama, `llama-server binary not found`, or
+Hermes errors about context below 64K / response truncation.
+
+**`llama-server binary not found` (Homebrew Ollama 0.30.x)**
+
+The Homebrew `ollama` formula omits the `llama-server` runner needed for
+GGUF models. Install the official app and let the script link the binary:
+
+```bash
+brew install --cask ollama-app
+./scripts/hermes-gemma-local.sh install-host   # re-runs ensure_llama_server + pull
+```
+
+**Context too small (Hermes 0.16+)**
+
+Hermes 0.16 requires ≥64K runtime context for tool use. The plain
+`gemma4:12b-it-qat` tag defaults to 4K–8K. Use the `gemma4-hermes` alias
+created by `hermes-gemma-local.sh setup` (sets `num_ctx=65536`). Re-run:
+
+```bash
+./scripts/hermes-gemma-local.sh enable-hermes
+./scripts/hermes-gemma-local.sh test
+```
+
+**Port 11435 vs 11434**
+
+Lima forwards guest `:11434` to the host for in-VM services. Host inference
+runs on `:11435` so the two do not collide. After reboot, restart host
+Ollama: `./scripts/hermes-gemma-local.sh start`.
+
+**UFW blocks VM → host**
+
+Cloud-init does not hardcode the Lima gateway IP. `hermes-gemma-local.sh
+enable-hermes` inserts a UFW egress rule dynamically. Re-run it if inference
+was working and stopped after a VM rebuild.
+
+**First request is slow**
+
+Cold-loading `gemma4-hermes` with 64K context on a 16 GiB Mac can take
+2–3 minutes. Subsequent requests are faster while Ollama keeps the model
+loaded (`OLLAMA_KEEP_ALIVE`, default 10m).
+
 #### OpenRouter 429 "add your own key" — is the API key missing?
 
 A 429 response with the message `add your own key to accumulate your rate
@@ -646,7 +720,7 @@ capacity is gone. Switch to a model that is currently available:
 
 ```bash
 ./scripts/list-free-models.sh                            # live list, changes as sponsors rotate
-./scripts/hermes.sh config set model.default <model-id>:free
+./scripts/hermes-model.sh                                # interactive picker (writes config.yaml)
 ./scripts/hermes-gateway.sh restart
 ```
 
@@ -848,6 +922,21 @@ brew install jq
 ```
 
 Used by some validation commands and by future scripts in this repo.
+
+### Ollama (local LLM backend)
+
+Required for the default Gemma backend (`hermes-gemma-local.sh`). Install
+both the CLI and the official app — Homebrew's formula alone is missing
+`llama-server` on 0.30.x:
+
+```bash
+brew install ollama
+brew install --cask ollama-app
+```
+
+Then run `./scripts/hermes-gemma-local.sh setup` from the repo. Host
+Ollama listens on port **11435** (not 11434). Logs:
+`./scripts/hermes-gemma-local.sh logs`.
 
 ### tmux (recommended for interactive `shell.sh`)
 
