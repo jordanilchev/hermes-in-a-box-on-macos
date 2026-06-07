@@ -364,6 +364,7 @@ provision:
       ExecStart=/srv/hermes/.local/bin/hermes gateway
       Restart=on-failure
       RestartSec=5
+      TimeoutStopSec=210
 
       NoNewPrivileges=yes
       ProtectSystem=strict

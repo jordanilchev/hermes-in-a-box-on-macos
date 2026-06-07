@@ -40,6 +40,11 @@ fi
 : "${LIMA_HOME:=${HERMES_VM_HOME}/lima}"
 : "${HERMES_VM_NAME:=ubuntu-hermes}"
 : "${HERMES_VERSION:=0.16.0}"
+: "${GEMMA_BASE_MODEL:=gemma4:12b-it-qat}"
+: "${GEMMA_MODEL:=gemma4-hermes}"
+: "${LOCAL_LLM_PORT:=11435}"
+: "${LOCAL_LLM_HOST:=host.lima.internal}"
+: "${LOCAL_LLM_CONTEXT:=65536}"
 : "${HERMES_SHELL_SESSION:=hermes-vm}"
 : "${HERMES_HOST_SHELL_SESSION:=hermes-host}"
 
@@ -47,6 +52,7 @@ fi
 HERMES_VM_REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 
 export HERMES_VM_HOME LIMA_HOME HERMES_VM_NAME HERMES_VM_REPO HERMES_VERSION \
+  GEMMA_BASE_MODEL GEMMA_MODEL LOCAL_LLM_PORT LOCAL_LLM_HOST LOCAL_LLM_CONTEXT \
   HERMES_SHELL_SESSION HERMES_HOST_SHELL_SESSION
 
 require_cmd() {
