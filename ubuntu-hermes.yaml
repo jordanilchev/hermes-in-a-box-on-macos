@@ -45,10 +45,10 @@
 
 vmType: vz
 
-# Tune to your host. The defaults below assume ~80% of an 8-core / 16 GiB
-# Apple Silicon machine. See README.md > C. Recommended sizing.
-cpus: 8
-memory: "12GiB"
+# Tune to your host. Defaults target a 10-core / 16 GiB Mac with host-side
+# Ollama (~9 GiB when loaded). See README.md > C. Recommended sizing.
+cpus: 6
+memory: "8GiB"
 disk: "60GiB"
 
 images:
@@ -227,6 +227,19 @@ provision:
       # provision steps (Docker needs /var/lib/docker mounted now).
       zfs load-key -a 2>/dev/null || true
       zfs mount -a   2>/dev/null || true
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Cap ZFS ARC so guest page cache does not compete with host Ollama on
+      # 16 GiB Macs. Hermes workload is ~300 MiB; default ARC can reach ~6 GiB.
+      set -eux -o pipefail
+      ARC_MAX_BYTES=2147483648
+      install -d /etc/modprobe.d
+      printf 'options zfs zfs_arc_max=%s\n' "${ARC_MAX_BYTES}" > /etc/modprobe.d/zfs.conf
+      if [ -w /sys/module/zfs/parameters/zfs_arc_max ]; then
+        echo "${ARC_MAX_BYTES}" > /sys/module/zfs/parameters/zfs_arc_max
+      fi
 
   - mode: system
     script: |

@@ -108,11 +108,28 @@ shell`; host-Ollama egress is added at runtime by `hermes-gemma-local.sh`).
 
 ### Recommended sizing
 
-If the host is mostly used to drive the agent inside this VM, dedicate
-roughly 80 % of host CPU cores and 75 % of host RAM to the guest. As an
-example, on a 10-core / 16 GiB host that is `cpus: 8`, `memory: "12GiB"`,
-leaving 4 GiB for macOS — those are the values shipped in
-`ubuntu-hermes.yaml`. Adjust both fields proportionally for your hardware.
+On a **16 GiB Mac with host-side Ollama**, inference holds ~9 GiB on the
+host when `gemma4-hermes` is loaded. The shipped defaults leave headroom
+for that:
+
+| Resource | Shipped default | Notes |
+|----------|-----------------|-------|
+| VM CPUs | `6` | Hermes gateway + rootless Docker rarely need more |
+| VM RAM | `8GiB` | Hermes workload is ~300 MiB; ZFS ARC capped at 2 GiB |
+| Host | ~8 GiB ceiling | macOS + Ollama model (~9 GiB when warm) |
+
+Older instances may still be on `cpus: 8` / `memory: "12GiB"`. To resize
+**without losing ZFS tank data**:
+
+```bash
+./scripts/hermes-vm-tune.sh
+```
+
+That stops the VM, patches the live `lima.yaml`, restarts, and verifies
+`tank` and `/srv/hermes` mountpoints. The 200 GiB `tank` disk is untouched.
+
+On larger hosts (32 GiB+), you can raise `HERMES_VM_MEMORY` and
+`HERMES_VM_CPUS` in `scripts/env.sh` before running `hermes-vm-tune.sh`.
 
 ### Emergency power-down (one-liner)
 
