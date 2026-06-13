@@ -99,6 +99,9 @@ chmod +x "$HOME/.local/bin/hermes"
 INNER_EOS
 OUTER_EOS
 
+echo "==> installing hardened hermes-gateway.service unit"
+"$(dirname "$0")/hermes-gateway.sh" install-unit
+
 cat <<MSG
 
 Hermes Agent ${HERMES_VERSION} installed. Next steps:

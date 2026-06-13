@@ -13,7 +13,8 @@
 #   ./scripts/hermes-gemma-local.sh setup          # install + pull + purge + enable
 #   ./scripts/hermes-gemma-local.sh install-host   # brew ollama + pull model (host)
 #   ./scripts/hermes-gemma-local.sh start|stop|status|logs
-#   ./scripts/hermes-gemma-local.sh purge-vm       # stop VM ollama + cursor-proxy
+#   ./scripts/hermes-gemma-local.sh purge-vm       # stop in-VM ollama (keeps cursor proxy)
+#   ./scripts/hermes-gemma-local.sh unload         # evict loaded model from host VRAM
 #   ./scripts/hermes-gemma-local.sh enable-hermes  # point all Hermes LLM routes local
 #   ./scripts/hermes-gemma-local.sh test           # smoke test from inside VM
 
@@ -25,9 +26,9 @@ set -eu
 : "${LOCAL_LLM_PORT:=11435}"
 : "${LOCAL_LLM_HOST:=host.lima.internal}"
 : "${LOCAL_LLM_CONTEXT:=65536}"
-: "${OLLAMA_KEEP_ALIVE:=24h}"
 
 LOCAL_LLM_BASE_URL="http://${LOCAL_LLM_HOST}:${LOCAL_LLM_PORT}/v1"
+CURSOR_PROXY_BASE_URL="http://localhost:${CURSOR_PROXY_PORT}/v1"
 
 require_cmd limactl
 
@@ -117,11 +118,15 @@ start_host_ollama() {
   # Stop brew service if it grabbed :11434 (conflicts with Lima guest forward).
   brew services stop ollama 2>/dev/null || true
 
-  echo "==> starting Ollama on 0.0.0.0:${LOCAL_LLM_PORT} (OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE})"
+  echo "==> starting Ollama on 0.0.0.0:${LOCAL_LLM_PORT} (keep_alive=${OLLAMA_KEEP_ALIVE}, kv_cache=${OLLAMA_KV_CACHE_TYPE})"
   # Bind all interfaces so the Lima guest can reach us via host.lima.internal.
+  # Memory tuning for 16 GiB hosts: one model, no parallel loads, compressed KV.
   nohup env \
     OLLAMA_HOST="0.0.0.0:${LOCAL_LLM_PORT}" \
     OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE}" \
+    OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS}" \
+    OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL}" \
+    OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE}" \
     OLLAMA_FLASH_ATTENTION=1 \
     "${ollama_bin}" serve \
     >"${HERMES_VM_HOME}/ollama-serve.log" 2>&1 &
@@ -153,12 +158,32 @@ stop_host_ollama() {
 
 host_status() {
   if curl -fsS "http://127.0.0.1:${LOCAL_LLM_PORT}/api/tags" >/dev/null 2>&1; then
-    echo "host Ollama: up on :${LOCAL_LLM_PORT}"
+    echo "host Ollama: up on :${LOCAL_LLM_PORT} (keep_alive=${OLLAMA_KEEP_ALIVE}, kv_cache=${OLLAMA_KV_CACHE_TYPE}, max_models=${OLLAMA_MAX_LOADED_MODELS})"
     curl -fsS "http://127.0.0.1:${LOCAL_LLM_PORT}/api/tags" \
       | python3 -c "import sys,json; d=json.load(sys.stdin); print('models:', ', '.join(m['name'] for m in d.get('models',[])) or '(none)')"
+    OLLAMA_HOST="127.0.0.1:${LOCAL_LLM_PORT}" ollama ps 2>/dev/null \
+      | awk 'NR==1{next} NF{print "loaded:", $0}'
+    local mem_free
+    mem_free="$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/{gsub(/%/,"",$2); print $2}')"
+    if [ -n "${mem_free}" ] && [ "${mem_free}" -lt 40 ] 2>/dev/null; then
+      echo "warning: host memory pressure high (${mem_free}% free) — unload with: $0 unload"
+    fi
   else
     echo "host Ollama: down"
   fi
+}
+
+unload_host_model() {
+  if ! curl -fsS "http://127.0.0.1:${LOCAL_LLM_PORT}/api/tags" >/dev/null 2>&1; then
+    echo "host Ollama is not running"
+    return 0
+  fi
+  echo "==> unloading ${GEMMA_MODEL} from host VRAM"
+  curl -fsS -X POST "http://127.0.0.1:${LOCAL_LLM_PORT}/api/generate" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${GEMMA_MODEL}\",\"keep_alive\":0}" >/dev/null || true
+  sleep 1
+  OLLAMA_HOST="127.0.0.1:${LOCAL_LLM_PORT}" ollama ps 2>/dev/null || echo "(no models loaded)"
 }
 
 ufw_allow_host_ollama() {
@@ -179,18 +204,30 @@ EOS
 
 purge_vm_backends() {
   require_vm
-  echo "==> stopping cloud/local VM LLM backends"
+  echo "==> stopping in-VM Ollama (cursor proxy kept for fallback)"
   limactl shell "${HERMES_VM_NAME}" -- sudo bash -s <<'EOS'
 set -eu
-for svc in hermes-cursor-proxy ollama; do
-  if systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q enabled; then
-    systemctl disable --now "${svc}.service" 2>/dev/null || true
-  else
-    systemctl stop "${svc}.service" 2>/dev/null || true
-  fi
-done
+if systemctl list-unit-files ollama.service 2>/dev/null | grep -q enabled; then
+  systemctl disable --now ollama.service 2>/dev/null || true
+else
+  systemctl stop ollama.service 2>/dev/null || true
+fi
 systemctl daemon-reload
-echo "disabled: hermes-cursor-proxy, ollama (in-VM)"
+echo "disabled: ollama (in-VM)"
+EOS
+}
+
+ensure_cursor_proxy() {
+  require_vm
+  limactl shell "${HERMES_VM_NAME}" -- sudo bash -s <<'EOS'
+set -eu
+if ! systemctl list-unit-files hermes-cursor-proxy.service 2>/dev/null | grep -q hermes-cursor-proxy; then
+  echo "cursor proxy not installed — run ./scripts/hermes-cursor-proxy.sh install first" >&2
+  exit 1
+fi
+systemctl enable --now hermes-cursor-proxy.service
+systemctl is-active --quiet hermes-cursor-proxy.service
+echo "cursor proxy: active on :4646"
 EOS
 }
 
@@ -198,11 +235,14 @@ enable_hermes() {
   require_vm
   ufw_allow_host_ollama
 
-  echo "==> routing all Hermes LLM calls to ${LOCAL_LLM_BASE_URL} (${GEMMA_MODEL})"
+  echo "==> routing Hermes primary to ${LOCAL_LLM_BASE_URL} (${GEMMA_MODEL}), fallback Cursor ${CURSOR_FALLBACK_MODEL}"
+  ensure_cursor_proxy
   limactl shell "${HERMES_VM_NAME}" -- sudo env \
     GEMMA_MODEL="${GEMMA_MODEL}" \
     LOCAL_LLM_BASE_URL="${LOCAL_LLM_BASE_URL}" \
     LOCAL_LLM_CONTEXT="${LOCAL_LLM_CONTEXT}" \
+    CURSOR_PROXY_BASE_URL="${CURSOR_PROXY_BASE_URL}" \
+    CURSOR_FALLBACK_MODEL="${CURSOR_FALLBACK_MODEL}" \
     bash -s <<'OUTER_EOS'
 set -eu
 HERMES_UID=$(id -u hermes)
@@ -211,9 +251,11 @@ runuser -u hermes -- env \
   GEMMA_MODEL="$GEMMA_MODEL" \
   LOCAL_LLM_BASE_URL="$LOCAL_LLM_BASE_URL" \
   LOCAL_LLM_CONTEXT="$LOCAL_LLM_CONTEXT" \
+  CURSOR_PROXY_BASE_URL="$CURSOR_PROXY_BASE_URL" \
+  CURSOR_FALLBACK_MODEL="$CURSOR_FALLBACK_MODEL" \
   PATH=/srv/hermes/.local/bin:/usr/bin:/bin \
   python3 <<'PY'
-import os, re, yaml
+import os, yaml
 from pathlib import Path
 
 path = Path("/srv/hermes/.hermes/config.yaml")
@@ -229,6 +271,13 @@ model.update({
     "ollama_num_ctx": int(os.environ["LOCAL_LLM_CONTEXT"]),
 })
 model.pop("fallback_providers", None)
+cfg.pop("fallback_model", None)
+cfg["fallback_providers"] = [{
+    "provider": "custom",
+    "model": os.environ["CURSOR_FALLBACK_MODEL"],
+    "base_url": os.environ["CURSOR_PROXY_BASE_URL"],
+    "api_key": "not-needed",
+}]
 
 aux = cfg.setdefault("auxiliary", {})
 for task, task_cfg in list(aux.items()):
@@ -245,6 +294,7 @@ path.write_text(yaml.dump(cfg, default_flow_style=False, allow_unicode=True, sor
 print("updated", path)
 print("  model.default =", model.get("default"))
 print("  model.base_url =", model.get("base_url"))
+print("  fallback =", cfg["fallback_providers"][0]["model"], "@", cfg["fallback_providers"][0]["base_url"])
 print("  auxiliary tasks =", len(aux))
 PY
 OUTER_EOS
@@ -281,6 +331,9 @@ case "$cmd" in
   stop)
     stop_host_ollama
     ;;
+  unload)
+    unload_host_model
+    ;;
   status)
     host_status
     if vm_running; then
@@ -312,16 +365,17 @@ case "$cmd" in
     test_inference
     cat <<MSG
 
-Gemma 4 12B QAT is now the only LLM backend.
-  Host:  Ollama ${GEMMA_MODEL} on 0.0.0.0:${LOCAL_LLM_PORT}
-  VM:    ${LOCAL_LLM_BASE_URL} (all model + auxiliary tasks)
-  Stopped: hermes-cursor-proxy, in-VM ollama
+Gemma 4 12B QAT is the primary LLM; Cursor auto is the fallback.
+  Host:     Ollama ${GEMMA_MODEL} on 0.0.0.0:${LOCAL_LLM_PORT}
+  Primary:  ${LOCAL_LLM_BASE_URL} (all model + auxiliary tasks)
+  Fallback: ${CURSOR_PROXY_BASE_URL} (${CURSOR_FALLBACK_MODEL})
+  Stopped:  in-VM ollama
 
 Logs: ./scripts/hermes-gemma-local.sh logs
 MSG
     ;;
   *)
-    echo "usage: $0 {setup|install-host|start|stop|status|logs|purge-vm|enable-hermes|test}" >&2
+    echo "usage: $0 {setup|install-host|start|stop|unload|status|logs|purge-vm|enable-hermes|test}" >&2
     exit 1
     ;;
 esac

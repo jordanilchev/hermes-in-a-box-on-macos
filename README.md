@@ -167,8 +167,8 @@ the same scripts work on any machine that meets the prerequisites.
 | [`hermes-update.sh`](./scripts/hermes-update.sh) | Upgrade (or pin) the Hermes Agent PyPI version: `./scripts/hermes-update.sh 0.16.0`. No-ops if already at target. Agent state/config/memory survive. |
 | [`hermes-config.sh`](./scripts/hermes-config.sh) | Prompt for an API key name and value; upsert into `/srv/hermes/.hermes/.env` via stdin — value never appears in `ps` or on host disk. |
 | [`hermes-env-edit.sh`](./scripts/hermes-env-edit.sh) | Open `/srv/hermes/.hermes/.env` in `$EDITOR` (vi/vim/nano/emacs) inside the VM as the `hermes` user. Preserves ownership and 0600 mode. |
-| [`hermes-gateway.sh`](./scripts/hermes-gateway.sh) | Manage `hermes-gateway.service` (start / stop / restart / status / logs / enable / disable). |
-| [`hermes-gemma-local.sh`](./scripts/hermes-gemma-local.sh) | **Default LLM backend:** host Ollama with Gemma 4 12B QAT (`gemma4-hermes` alias, 64K ctx). Subcommands: `setup`, `start/stop/status/logs`, `enable-hermes`, `purge-vm`, `test`. Stops in-VM Ollama and Cursor proxy. |
+| [`hermes-gateway.sh`](./scripts/hermes-gateway.sh) | Manage `hermes-gateway.service` (install-unit / start / stop / restart / status / logs / enable / disable). Installs hardened unit before start. |
+| [`hermes-gemma-local.sh`](./scripts/hermes-gemma-local.sh) | **Default LLM backend:** host Ollama with Gemma 4 12B QAT (`gemma4-hermes` alias, 64K ctx). Subcommands: `setup`, `start/stop/unload/status/logs`, `enable-hermes`, `purge-vm`, `test`. Cursor proxy kept for fallback. |
 | [`hermes-cursor-proxy.sh`](./scripts/hermes-cursor-proxy.sh) | *(Legacy)* Cursor Agent API proxy (`hermes-cursor-proxy.service`, port 4646). Not used when `hermes-gemma-local.sh setup` is active. |
 | [`hermes-model.sh`](./scripts/hermes-model.sh) | *(Legacy)* Interactive OpenRouter model picker; writes `model.default` and fallbacks to `config.yaml`. |
 | [`hermes.sh`](./scripts/hermes.sh) | Run any `hermes` subcommand as the `hermes` user inside the VM (e.g. `./scripts/hermes.sh chat`). |
@@ -189,6 +189,10 @@ All scripts source [`scripts/env.sh`](./scripts/env.sh), which respects:
 | `GEMMA_MODEL` | `gemma4-hermes` | Local Ollama alias (base model + `num_ctx`); Hermes routes here. |
 | `LOCAL_LLM_PORT` | `11435` | Host Ollama port (11434 is reserved for Lima's in-VM forward). |
 | `LOCAL_LLM_CONTEXT` | `65536` | Context window for Hermes 0.16+ tool use (requires ≥64K). |
+| `OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama keeps a loaded model in VRAM when idle. |
+| `OLLAMA_MAX_LOADED_MODELS` | `1` | Cap loaded models (16 GiB host tuning). |
+| `OLLAMA_NUM_PARALLEL` | `1` | Disable concurrent model loads. |
+| `OLLAMA_KV_CACHE_TYPE` | `q8_0` | Compressed KV cache (about half the RAM of default f16). |
 | `HERMES_SHELL_SESSION` | `hermes-vm` | Host tmux session name used by interactive `shell.sh`. |
 | `HERMES_HOST_SHELL_SESSION` | `hermes-host` | Host tmux session name for SSH logins (after `host-shell-setup.sh install`). |
 | `HERMES_SHELL_TMUX` | `1` | Set to `0` to disable host tmux wrapping in `shell.sh`. |
@@ -660,20 +664,18 @@ The `ExecStart` line never appears.
 Root cause: systemd's `%U` specifier in `Environment=` lines resolves in the
 system (root) context, yielding UID 0, not the UID of `User=hermes`. The
 pre-check therefore tests `/run/user/0/docker.sock`, which does not exist.
-This bug is fixed in `ubuntu-hermes.yaml` (hardcoded UID 999 and `id -u
-hermes` at exec time). If the live service file pre-dates the fix, apply it
-manually:
+Hermes Agent's upstream `hermes gateway service install` also ships this bug.
+The hardened unit lives in [`scripts/hermes-gateway.service`](./scripts/hermes-gateway.service)
+(hardcoded UID 999 and `id -u hermes` at exec time). Reinstall it with:
 
 ```bash
-./scripts/shell.sh -- sudo sed -i \
-  's|/run/user/%U|/run/user/999|g' \
-  /etc/systemd/system/hermes-gateway.service
-./scripts/shell.sh -- sudo sed -i \
-  "s|until test -S \"\\\$XDG_RUNTIME_DIR/docker.sock\"|until test -S \"/run/user/\$(id -u hermes)/docker.sock\"|" \
-  /etc/systemd/system/hermes-gateway.service
-./scripts/shell.sh -- sudo systemctl daemon-reload
+./scripts/hermes-gateway.sh install-unit
 ./scripts/hermes-gateway.sh start
 ```
+
+`install-unit` runs automatically before `start`, `restart`, and `enable`.
+Do **not** run `hermes gateway service install` — it overwrites the hardened
+unit with the broken `%U` version.
 
 #### Local Ollama / Gemma inference fails
 
@@ -717,7 +719,51 @@ was working and stopped after a VM rebuild.
 
 Cold-loading `gemma4-hermes` with 64K context on a 16 GiB Mac can take
 2–3 minutes. Subsequent requests are faster while Ollama keeps the model
-loaded (`OLLAMA_KEEP_ALIVE`, default 24h).
+loaded (`OLLAMA_KEEP_ALIVE`, default `30m`).
+
+**Hangs or extreme slowness under heavy load (16 GiB Mac)**
+
+On a 16 GiB host, `gemma4-hermes` at 64K context holds ~7–8 GiB in VRAM
+plus KV cache. Under memory pressure (VM + macOS + other apps), macOS swaps
+and requests can hang for many minutes or appear stuck.
+
+Check load and free VRAM:
+
+```bash
+./scripts/hermes-gemma-local.sh status    # warns when host memory < 40% free
+OLLAMA_HOST=127.0.0.1:11435 ollama ps     # shows loaded model size/context
+```
+
+Unload the model when idle to reclaim ~8 GiB:
+
+```bash
+./scripts/hermes-gemma-local.sh unload
+```
+
+Tune keep-alive (shorter = more cold starts, less RAM pinned):
+
+```bash
+export OLLAMA_KEEP_ALIVE=10m
+./scripts/hermes-gemma-local.sh stop && ./scripts/hermes-gemma-local.sh start
+```
+
+`hermes-gemma-local.sh start` sets 16 GiB-friendly Ollama defaults automatically:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OLLAMA_MAX_LOADED_MODELS` | `1` | Only one model in VRAM |
+| `OLLAMA_NUM_PARALLEL` | `1` | No concurrent model loads |
+| `OLLAMA_KV_CACHE_TYPE` | `q8_0` | Halves KV cache vs default f16 |
+| `OLLAMA_KEEP_ALIVE` | `30m` | Evict idle model sooner |
+| `OLLAMA_FLASH_ATTENTION` | `1` | Lower peak activation memory |
+
+Restart Ollama after changing any of these (`stop` then `start`).
+
+Do **not** enable MTP (Multi-Token Prediction) on 16 GiB — the draft model
+adds ~2 GiB headroom and worsens swap thrashing under load. Cursor fallback
+handles outages when local inference is unavailable.
+
+MTP is viable only on 32 GiB+ hosts with headroom to spare.
 
 #### OpenRouter 429 "add your own key" — is the API key missing?
 

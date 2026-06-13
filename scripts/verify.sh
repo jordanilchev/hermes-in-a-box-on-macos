@@ -106,6 +106,17 @@ if shell sudo -u hermes cat /etc/zfs/tank.key 2>&1 | grep -qi 'permission denied
 else
   miss "hermes can read /etc/zfs/tank.key"
 fi
+# hermes-gateway unit must not use systemd %U (resolves to root UID 0 in Environment=)
+unit=$(shell cat /etc/systemd/system/hermes-gateway.service 2>/dev/null || true)
+if [ -z "${unit}" ]; then
+  miss "hermes-gateway.service missing"
+elif printf '%s\n' "${unit}" | grep -q '%U'; then
+  miss "hermes-gateway.service uses %U (broken docker.sock path)"
+elif ! printf '%s\n' "${unit}" | grep -q 'XDG_RUNTIME_DIR=/run/user/999'; then
+  miss "hermes-gateway.service missing hardened XDG_RUNTIME_DIR"
+else
+  pass "hermes-gateway.service hardened (no %U)"
+fi
 
 echo
 [[ $fail -eq 0 ]] && echo "all checks passed" || { echo "FAILED checks above" >&2; exit 1; }

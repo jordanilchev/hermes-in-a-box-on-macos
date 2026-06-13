@@ -46,6 +46,9 @@ echo "hermes-agent updated to ${TARGET_VERSION}"
 INNER_EOS
 OUTER_EOS
 
+echo "==> refreshing hardened hermes-gateway.service unit"
+"$(dirname "$0")/hermes-gateway.sh" install-unit
+
 cat <<MSG
 
 Hermes Agent updated to ${TARGET_VERSION}.

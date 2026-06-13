@@ -69,52 +69,7 @@ echo "==> Starting ${HERMES_VM_NAME}"
 "$(dirname "$0")/start.sh"
 
 echo "==> Refreshing hermes-gateway.service unit (UID 999 docker.sock paths)"
-limactl shell "${HERMES_VM_NAME}" -- sudo bash -s <<'EOS'
-set -eu
-cat > /etc/systemd/system/hermes-gateway.service <<'UNIT'
-[Unit]
-Description=Hermes Agent gateway (Nous Research)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=hermes
-Group=hermes
-Environment=HOME=/srv/hermes
-Environment=XDG_RUNTIME_DIR=/run/user/999
-Environment=DOCKER_HOST=unix:///run/user/999/docker.sock
-Environment=PATH=/srv/hermes/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStartPre=/bin/sh -c 'uid=$(id -u hermes); i=0; until test -S "/run/user/$uid/docker.sock"; do i=$((i+1)); [ $i -ge 30 ] && exit 1; sleep 1; done'
-ExecStart=/srv/hermes/.local/bin/hermes gateway
-Restart=on-failure
-RestartSec=5
-TimeoutStopSec=210
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/srv/hermes /var/lib/hermes /var/log/hermes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-RestrictSUIDSGID=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
-SystemCallFilter=@system-service
-SystemCallArchitectures=native
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-systemctl daemon-reload
-EOS
+"$(dirname "$0")/hermes-gateway.sh" install-unit
 
 echo "==> Capping ZFS ARC + verifying tank / Hermes data"
 limactl shell "${HERMES_VM_NAME}" -- sudo env ZFS_ARC_MAX_BYTES="${ZFS_ARC_MAX_BYTES}" bash -s <<'EOS'

@@ -350,6 +350,7 @@ provision:
       #!/bin/bash
       # Drop the hermes-gateway.service systemd unit. NOT enabled here —
       # operator starts via ./scripts/hermes-gateway.sh after API key is set.
+      # Keep in sync with scripts/hermes-gateway.service (canonical source).
       # Hardening goes beyond upstream's reference (NoNewPrivileges,
       # ProtectSystem=strict, PrivateTmp): empty CapabilityBoundingSet so the
       # unit can never gain CAP_NET_ADMIN (UFW) or CAP_NET_BIND_SERVICE (port
