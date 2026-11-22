@@ -42,9 +42,17 @@ fi
 : "${HERMES_VM_CPUS:=6}"
 : "${HERMES_VM_MEMORY:=8GiB}"
 : "${ZFS_ARC_MAX_BYTES:=2147483648}"
-: "${HERMES_VERSION:=0.16.0}"
+: "${HERMES_VERSION:=0.23.1}"
+# When PyPI lags GitHub, hermes-update.sh prefers this release tag / git ref.
+: "${HERMES_GIT_REF:=v0.23.1}"
 : "${GEMMA_BASE_MODEL:=gemma4:12b-it-qat}"
 : "${GEMMA_MODEL:=gemma4-hermes}"
+# Local LLM backend: "inkling" (llama-server GGUF) or "gemma" (host Ollama).
+# Persist choice in ${HERMES_VM_HOME}/llm-backend; default gemma until Inkling cutover is proven.
+: "${INKLING_HF_REPO:=AtomicChat/Inkling-2-Mini-GGUF}"
+: "${INKLING_GGUF_FILE:=Inkling-2-Mini-AD-IQ1_M.gguf}"
+: "${INKLING_MODEL:=inkling-2-mini-adiq1}"
+: "${INKLING_SHADOW_PORT:=11436}"
 : "${LOCAL_LLM_PORT:=11435}"
 : "${LOCAL_LLM_HOST:=host.lima.internal}"
 : "${LOCAL_LLM_CONTEXT:=65536}"
@@ -56,16 +64,31 @@ fi
 : "${CURSOR_FALLBACK_MODEL:=auto}"
 : "${HERMES_SHELL_SESSION:=hermes-vm}"
 : "${HERMES_HOST_SHELL_SESSION:=hermes-host}"
+: "${HERMES_TERMINAL_IMAGE:=hermes-terminal:node24-py312}"
 
 # Resolve the repo root from this script's location: scripts/env.sh -> ..
 HERMES_VM_REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 
+# Backend state file wins over shell default; missing/invalid → gemma (safe reboot).
+LLM_BACKEND_FILE="${HERMES_VM_HOME}/llm-backend"
+if [ -z "${LOCAL_LLM_BACKEND:-}" ]; then
+  if [ -f "${LLM_BACKEND_FILE}" ]; then
+    LOCAL_LLM_BACKEND="$(tr -d '[:space:]' < "${LLM_BACKEND_FILE}" || true)"
+  fi
+fi
+case "${LOCAL_LLM_BACKEND:-}" in
+  inkling|gemma) ;;
+  *) LOCAL_LLM_BACKEND=gemma ;;
+esac
+
 export HERMES_VM_HOME LIMA_HOME HERMES_VM_NAME HERMES_VM_CPUS HERMES_VM_MEMORY \
-  ZFS_ARC_MAX_BYTES HERMES_VM_REPO HERMES_VERSION \
-  GEMMA_BASE_MODEL GEMMA_MODEL LOCAL_LLM_PORT LOCAL_LLM_HOST LOCAL_LLM_CONTEXT \
+  ZFS_ARC_MAX_BYTES HERMES_VM_REPO HERMES_VERSION HERMES_GIT_REF \
+  GEMMA_BASE_MODEL GEMMA_MODEL LOCAL_LLM_BACKEND LLM_BACKEND_FILE \
+  INKLING_HF_REPO INKLING_GGUF_FILE INKLING_MODEL INKLING_SHADOW_PORT \
+  LOCAL_LLM_PORT LOCAL_LLM_HOST LOCAL_LLM_CONTEXT \
   OLLAMA_KEEP_ALIVE OLLAMA_MAX_LOADED_MODELS OLLAMA_NUM_PARALLEL OLLAMA_KV_CACHE_TYPE \
   CURSOR_PROXY_PORT CURSOR_FALLBACK_MODEL \
-  HERMES_SHELL_SESSION HERMES_HOST_SHELL_SESSION
+  HERMES_SHELL_SESSION HERMES_HOST_SHELL_SESSION HERMES_TERMINAL_IMAGE
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then

@@ -13,6 +13,7 @@
 #   ./scripts/hermes-gemma-local.sh setup          # install + pull + purge + enable
 #   ./scripts/hermes-gemma-local.sh install-host   # brew ollama + pull model (host)
 #   ./scripts/hermes-gemma-local.sh start|stop|status|logs
+#   ./scripts/hermes-gemma-local.sh ensure-guest   # UFW host-ollama egress (VM must be up)
 #   ./scripts/hermes-gemma-local.sh purge-vm       # stop in-VM ollama (keeps cursor proxy)
 #   ./scripts/hermes-gemma-local.sh unload         # evict loaded model from host VRAM
 #   ./scripts/hermes-gemma-local.sh enable-hermes  # point all Hermes LLM routes local
@@ -103,6 +104,23 @@ EOF
   rm -f "${modelfile}"
 }
 
+ollama_launchd_label="com.hermes-in-a-box.ollama"
+
+ollama_managed_by_launchd() {
+  launchctl print "gui/$(id -u)/${ollama_launchd_label}" >/dev/null 2>&1
+}
+
+wait_for_ollama() {
+  local i
+  for i in $(seq 1 45); do
+    if curl -fsS "http://127.0.0.1:${LOCAL_LLM_PORT}/api/tags" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 start_host_ollama() {
   local ollama_bin
   ollama_bin="$(host_ollama)" || { echo "error: Ollama not installed — run install-host first" >&2; exit 1; }
@@ -115,12 +133,25 @@ start_host_ollama() {
     return 0
   fi
 
+  # Prefer launchd KeepAlive agent when installed (survives login/reboot).
+  if ollama_managed_by_launchd; then
+    echo "==> kicking launchd ${ollama_launchd_label}"
+    launchctl kickstart -k "gui/$(id -u)/${ollama_launchd_label}" 2>/dev/null || true
+    if wait_for_ollama; then
+      echo "Ollama ready (launchd ${ollama_launchd_label})"
+      return 0
+    fi
+    echo "error: launchd Ollama did not become ready — see ${HOME}/Library/Logs/hermes-in-a-box/ollama-serve.launchd.err" >&2
+    exit 1
+  fi
+
   # Stop brew service if it grabbed :11434 (conflicts with Lima guest forward).
   brew services stop ollama 2>/dev/null || true
 
   echo "==> starting Ollama on 0.0.0.0:${LOCAL_LLM_PORT} (keep_alive=${OLLAMA_KEEP_ALIVE}, kv_cache=${OLLAMA_KV_CACHE_TYPE})"
   # Bind all interfaces so the Lima guest can reach us via host.lima.internal.
   # Memory tuning for 16 GiB hosts: one model, no parallel loads, compressed KV.
+  mkdir -p "${HERMES_VM_HOME}"
   nohup env \
     OLLAMA_HOST="0.0.0.0:${LOCAL_LLM_PORT}" \
     OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE}" \
@@ -132,18 +163,21 @@ start_host_ollama() {
     >"${HERMES_VM_HOME}/ollama-serve.log" 2>&1 &
   echo $! >"${HERMES_VM_HOME}/ollama-serve.pid"
 
-  for _ in $(seq 1 30); do
-    if curl -fsS "http://127.0.0.1:${LOCAL_LLM_PORT}/api/tags" >/dev/null 2>&1; then
-      echo "Ollama ready (pid $(cat "${HERMES_VM_HOME}/ollama-serve.pid"))"
-      return 0
-    fi
-    sleep 1
-  done
+  if wait_for_ollama; then
+    echo "Ollama ready (pid $(cat "${HERMES_VM_HOME}/ollama-serve.pid"))"
+    return 0
+  fi
   echo "error: Ollama did not become ready — see ${HERMES_VM_HOME}/ollama-serve.log" >&2
   exit 1
 }
 
 stop_host_ollama() {
+  if ollama_managed_by_launchd; then
+    echo "==> stopping launchd ${ollama_launchd_label} (KeepAlive will respawn unless unloaded)"
+    launchctl kill SIGTERM "gui/$(id -u)/${ollama_launchd_label}" 2>/dev/null || true
+    # For a lasting stop while autostart is installed, bootout the agent:
+    #   ./scripts/hermes-autostart.sh uninstall
+  fi
   if [ -f "${HERMES_VM_HOME}/ollama-serve.pid" ]; then
     local pid
     pid="$(cat "${HERMES_VM_HOME}/ollama-serve.pid")"
@@ -327,6 +361,13 @@ case "$cmd" in
     ;;
   start)
     start_host_ollama
+    if vm_running; then
+      ufw_allow_host_ollama || true
+    fi
+    ;;
+  ensure-guest)
+    require_vm
+    ufw_allow_host_ollama
     ;;
   stop)
     stop_host_ollama
@@ -372,10 +413,11 @@ Gemma 4 12B QAT is the primary LLM; Cursor auto is the fallback.
   Stopped:  in-VM ollama
 
 Logs: ./scripts/hermes-gemma-local.sh logs
+Persist across Mac login/reboot: ./scripts/hermes-autostart.sh install
 MSG
     ;;
   *)
-    echo "usage: $0 {setup|install-host|start|stop|unload|status|logs|purge-vm|enable-hermes|test}" >&2
+    echo "usage: $0 {setup|install-host|start|stop|ensure-guest|unload|status|logs|purge-vm|enable-hermes|test}" >&2
     exit 1
     ;;
 esac

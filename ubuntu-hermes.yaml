@@ -146,7 +146,9 @@ provision:
       [Resolve]
       DNS=1.1.1.2 9.9.9.9
       FallbackDNS=1.0.0.2
-      DNSSEC=yes
+      # allow-downgrade: strict DNSSEC breaks many public names (e.g. github.com)
+      # with "no-signature" and blocks hermes-update / apt over HTTPS.
+      DNSSEC=allow-downgrade
       EOF
       systemctl restart systemd-resolved
 

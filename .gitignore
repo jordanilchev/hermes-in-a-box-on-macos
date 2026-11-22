@@ -16,3 +16,15 @@ tank.key
 tank.key.b64
 *.key
 *.key.b64
+
+# Python bytecode / local caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Personal / local-only runtime artifacts (do not publish)
+scripts/hermes-runtime-AGENTS.md
+scripts/ai-bubble-dashboard/
+scripts/ai-bubble-dashboard.sh
+scripts/ai-bubble-dashboard/**/data/
+scripts/ai-bubble-dashboard/**/.server.*
